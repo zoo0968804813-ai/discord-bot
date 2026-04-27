@@ -116,7 +116,7 @@ Bot 會計算你的工作時間，並隨機回覆下班辛苦訊息～
       const user = await client.users.fetch(targetUserId);
       const timeText = formatWorkTime(Date.now() - startTime);
 
-      result += `👤打工人 ${user.username}：已上班 ${timeText}\n`;
+      result += `👤 ${user.username}：已上班 ${timeText}\n`;
     }
 
     message.reply(result);

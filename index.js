@@ -1,5 +1,11 @@
 require("dotenv").config();
 
+const { Pool } = require("pg");
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
 const { Client, GatewayIntentBits } = require("discord.js");
 
 const client = new Client({
@@ -51,8 +57,18 @@ function formatWorkTime(ms) {
   return `${hours}小時${minutes}分${seconds}秒`;
 }
 
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`機器人已上線：${client.user.tag}`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS work_totals (
+      user_id TEXT PRIMARY KEY,
+      username TEXT,
+      total_seconds BIGINT DEFAULT 0
+    );
+  `);
+
+  console.log("資料表確認完成");
 });
 
 client.on("messageCreate", async (message) => {
@@ -188,8 +204,46 @@ Bot 會計算你的工作時間，並隨機回覆下班辛苦訊息～
       message.reply(`${message.author} 你今天好像還沒有說上班喔～`);
       return;
     }
+  // ===== 觸發 「排行榜」 =====
+  if (content === "!排行榜") {
+    const result = await pool.query(`
+      SELECT username, total_seconds
+      FROM work_totals
+      ORDER BY total_seconds DESC
+      LIMIT 10
+    `);
+
+    if (result.rows.length === 0) {
+      message.reply("目前沒有排行榜資料");
+      return;
+    }
+
+    let text = "🏆 打工人總工時排行榜\n\n";
+
+    result.rows.forEach((row, index) => {
+      const hours = Math.floor(row.total_seconds / 3600);
+      const minutes = Math.floor((row.total_seconds % 3600) / 60);
+      const seconds = row.total_seconds % 60;
+
+      text += `${index + 1}. ${row.username}：${hours}小時${minutes}分${seconds}秒\n`;
+    });
+
+    message.reply(text);
+    return;
+}
 
     const diffMs = now - startTime;
+
+    const totalSeconds = Math.floor(diffMs / 1000);
+
+    await pool.query(`
+      INSERT INTO work_totals (user_id, username, total_seconds)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        total_seconds = work_totals.total_seconds + $3,
+        username = $2
+    `, [userId, message.author.username, totalSeconds]);
 
     if (diffMs > 24 * 60 * 60 * 1000) {
       workStartTimes.delete(userId);

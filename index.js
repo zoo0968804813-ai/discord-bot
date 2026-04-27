@@ -39,7 +39,7 @@ client.on("messageCreate", async (message) => {
   const now = Date.now();
 
     // ===== 指令說明 =====
-  if (content.trim() === "!wt help") {
+  if (content.trim() === "/help") {
     const helpText = `
 📖 **WorkTime Bot 指令說明**
 
@@ -70,7 +70,10 @@ Bot 會記錄你的上班開始時間，並隨機給您加油打氣！
 Bot 會計算你的工作時間，並隨機回覆下班辛苦訊息～
 `;
 
-    message.reply(helpText);
+    await interaction.reply({
+      content: helpText,
+      ephemeral: true,
+    });
     return;
   }
 

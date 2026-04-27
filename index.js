@@ -39,7 +39,7 @@ client.on("messageCreate", async (message) => {
   const now = Date.now();
 
     // ===== 指令說明 =====
-  if (content.trim() === "/help") {
+  if (content.trim() === "/wt help") {
     const helpText = `
 📖 **WorkTime Bot 指令說明**
 

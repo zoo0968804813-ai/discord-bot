@@ -30,7 +30,7 @@ client.once("ready", () => {
   console.log(`機器人已上線：${client.user.tag}`);
 });
 
-client.on("messageCreate", (message) => {
+client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (message.channel.id !== process.env.CHANNEL_ID) return;
 
@@ -38,6 +38,68 @@ client.on("messageCreate", (message) => {
   const userId = message.author.id;
   const now = Date.now();
 
+  // ===== 查詢全部人 =====
+  if (content.trim() === "!查詢") {
+    if (workStartTimes.size === 0) {
+      message.reply("目前沒有任何人上班中");
+      return;
+    }
+
+    let result = "📋 目前上班中的人：\n";
+
+    for (const [targetUserId, startTime] of workStartTimes) {
+      const user = await client.users.fetch(targetUserId);
+
+      const diffMs = Date.now() - startTime;
+      const totalSeconds = Math.floor(diffMs / 1000);
+
+      const hours = Math.floor(totalSeconds / 3600);
+      const minutes = Math.floor((totalSeconds % 3600) / 60);
+      const seconds = totalSeconds % 60;
+
+      result += `👤 ${user.username}：已上班 ${hours}小時${minutes}分${seconds}秒\n`;
+    }
+
+    message.reply(result);
+    return;
+  }
+    // ===== 手動增加工時 =====
+  if (content.startsWith("!wt add worktime")) {
+    const args = content.split(" ");
+
+    // 格式錯誤
+    if (args.length < 5) {
+      message.reply("格式錯誤！用法：!wt add worktime @用戶 秒數");
+      return;
+    }
+
+    const targetUser = message.mentions.users.first();
+    const seconds = parseInt(args[4]);
+
+    if (!targetUser || isNaN(seconds)) {
+      message.reply("請正確標記打工人並輸入秒數！");
+      return;
+    }
+
+    const targetUserId = targetUser.id;
+    const currentStartTime = workStartTimes.get(targetUserId);
+
+    if (!currentStartTime) {
+      message.reply("這位打工人目前沒有上班的紀錄ㄛ！");
+      return;
+    }
+
+    // 👉 核心邏輯：把時間往前推 = 增加工時
+    const newStartTime = currentStartTime - (seconds * 1000);
+
+    workStartTimes.set(targetUserId, newStartTime);
+
+    message.reply(
+      `已為打工人 ${targetUser.username} 增加 ${seconds} 秒工時`
+    );
+
+    return;
+  }
   // 觸發「上班」
   if (content.includes("上班")) {
     workStartTimes.set(userId, now);
@@ -69,27 +131,14 @@ client.on("messageCreate", (message) => {
       );
       return;
     }
+    
+    const totalSeconds = Math.floor(diffMs / 1000);
 
-    const totalMinutes = Math.floor(diffMs / (1000 * 60));
-    const hours = Math.floor(totalMinutes / 60);
-    const minutes = totalMinutes % 60;
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
 
-    // 秒數省略，分鐘數每 5 分鐘為一階
-    // 0~5 分鐘 = 0 分鐘
-    // 6~10 分鐘 = 5 分鐘
-    // 11~15 分鐘 = 10 分鐘，以此類推
-    const roundedMinutes = Math.floor((minutes - 1) / 5) * 5;
-    const finalMinutes = roundedMinutes < 0 ? 0 : roundedMinutes;
-
-    let timeText = "";
-
-    if (hours > 0 && finalMinutes > 0) {
-      timeText = `${hours}小時${finalMinutes}分鐘`;
-    } else if (hours > 0) {
-      timeText = `${hours}小時`;
-    } else {
-      timeText = `${finalMinutes}分鐘`;
-    }
+    const timeText = `${hours}小時${minutes}分${seconds}秒`;
 
     const randomReply =
       offWorkReplies[Math.floor(Math.random() * offWorkReplies.length)];

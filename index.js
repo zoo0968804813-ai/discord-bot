@@ -70,10 +70,7 @@ Bot 會記錄你的上班開始時間，並隨機給您加油打氣！
 Bot 會計算你的工作時間，並隨機回覆下班辛苦訊息～
 `;
 
-    await interaction.reply({
-      content: helpText,
-      ephemeral: true,
-    });
+    message.reply(helpText);
     return;
   }
 

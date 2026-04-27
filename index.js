@@ -38,6 +38,42 @@ client.on("messageCreate", async (message) => {
   const userId = message.author.id;
   const now = Date.now();
 
+    // ===== 指令說明 =====
+  if (content.trim() === "!wt help") {
+    const helpText = `
+📖 **WorkTime Bot 指令說明**
+
+**!wt help**
+顯示所有指令與使用方式。
+
+**!查詢**
+查詢目前所有上班中的打工人，以及已經上班多久ㄌ。
+範例：
+\`!查詢\`
+
+**!wt add worktime @用戶 秒數**
+[僅提供開發DEBUG使用]
+替指定使用者增加工時。
+使用者必須目前正在上班中。
+
+範例：
+\`!wt add worktime @HizuJin 3600\`
+
+代表幫 @HizuJin 增加 3600 秒，也就是 1 小時。
+
+📌 **一般觸發詞**
+
+只要訊息包含 **上班**：
+Bot 會記錄你的上班開始時間，並隨機給您加油打氣！
+
+只要訊息包含 **下班**：
+Bot 會計算你的工作時間，並隨機回覆下班辛苦訊息～
+`;
+
+    message.reply(helpText);
+    return;
+  }
+
   // ===== 查詢全部人 =====
   if (content.trim() === "!查詢") {
     if (workStartTimes.size === 0) {

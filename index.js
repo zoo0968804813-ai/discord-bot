@@ -588,7 +588,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.customId === "wt_help") {
       await interaction.reply({
         content:
-          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!wt add worktime @人 秒數`\n`!wt clear worktime @人`\n`!wt add workmood @人 指數`\n`!wt remove workmood @人`\n`!強制上班 @人`\n`!強制下班 @人`",
+          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!wt add worktime @人 秒數`\n`!wt clear worktime @人`\n`!wt add workmood @人 指數`\n`!wt clear workmood @人`\n`!強制上班 @人`\n`!強制下班 @人`",
         ephemeral: true,
       });
       return;

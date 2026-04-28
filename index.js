@@ -651,26 +651,34 @@ client.on("messageCreate", async (msg) => {
     const uid = msg.author.id;
     const now = Date.now();
 
-    if (c.toUpperCase() === "Y") {
-      const clearPending = clearConfirmations.get(uid);
-      const moodPending = moodResetConfirmations.get(uid);
+const clearPending = clearConfirmations.get(uid);
+const moodPending = moodResetConfirmations.get(uid);
 
-      if (clearPending) {
-        await clearWork(clearPending.id);
-        clearConfirmations.delete(uid);
+if (clearPending || moodPending) {
+  if (c.toUpperCase() !== "Y") {
+    clearConfirmations.delete(uid);
+    moodResetConfirmations.delete(uid);
 
-        msg.reply(`已清除 ${clearPending.name} 的排行榜紀錄。`);
-        return;
-      }
+    msg.reply("已取消此次確認操作。");
+    return;
+  }
 
-      if (moodPending) {
-        await resetMood(moodPending.id);
-        moodResetConfirmations.delete(uid);
+  if (clearPending) {
+    await clearWork(clearPending.id);
+    clearConfirmations.delete(uid);
 
-        msg.reply(`已重置 ${moodPending.name} 的心情指數為 0。`);
-        return;
-      }
-    }
+    msg.reply(`已清除 ${clearPending.name} 的排行榜紀錄。`);
+    return;
+  }
+
+  if (moodPending) {
+    await resetMood(moodPending.id);
+    moodResetConfirmations.delete(uid);
+
+    msg.reply(`已重置 ${moodPending.name} 的心情指數為 0。`);
+    return;
+  }
+}
 
     if (c === "!面板" || c === "!幫助") {
       await msg.reply(getPanel());

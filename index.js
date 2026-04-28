@@ -26,6 +26,7 @@ const client = new Client({
 
 const workStartTimes = new Map();
 const clearConfirmations = new Map();
+const moodResetConfirmations = new Map();
 
 const workReplies = [
   "又是辛勤工作的一天呢！上班要加油窩～ 💖！",
@@ -100,11 +101,78 @@ function isEnd(t) {
   return t.includes("下班") && !isQuestion(t) && !isOther(t);
 }
 
+function getMoodText(score, username) {
+  const s = Number(score) || 0;
+
+  if (s >= 20) return `${username} 已經愛上工作了，根本是打工之神`;
+  if (s >= 15) return `${username} 非常熱愛這份工作`;
+  if (s >= 10) return `${username} 似乎很喜歡他的工作`;
+  if (s >= 5) return `${username} 還蠻享受工作的`;
+  if (s >= 1) return `${username} 覺得工作還算不錯`;
+  if (s === 0) return `${username} 對工作沒什麼特別感覺`;
+  if (s >= -4) return `${username} 有點不太想上班`;
+  if (s >= -9) return `${username} 似乎不是很喜歡他的工作`;
+  if (s >= -14) return `${username} 似乎很討厭他的工作`;
+  if (s >= -19) return `${username} 已經開始厭世了`;
+  return `${username} 已經徹底不想上班了`;
+}
+
+function getMoodButtons(userId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`mood:${userId}:2`)
+      .setLabel("良好")
+      .setEmoji("😄")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId(`mood:${userId}:1`)
+      .setLabel("還行")
+      .setEmoji("🙂")
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId(`mood:${userId}:0`)
+      .setLabel("沒啥")
+      .setEmoji("😐")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId(`mood:${userId}:-1`)
+      .setLabel("超爛")
+      .setEmoji("😵")
+      .setStyle(ButtonStyle.Danger),
+
+    new ButtonBuilder()
+      .setCustomId(`mood:${userId}:-2`)
+      .setLabel("爛透了")
+      .setEmoji("💀")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+async function sendMoodPrompt(user) {
+  try {
+    await user.send({
+      content:
+        "今天下班啦～請幫今天的工作心情打個分數：\n\n" +
+        "😄 良好：+2\n" +
+        "🙂 還行：+1\n" +
+        "😐 沒啥：0\n" +
+        "😵 超爛：-1\n" +
+        "💀 爛透了：-2",
+      components: [getMoodButtons(user.id)],
+    });
+  } catch {
+    // 使用者關閉私訊時略過
+  }
+}
+
 async function addWork(userId, username, sec) {
   await pool.query(
     `
-    INSERT INTO work_totals (user_id, username, total_seconds)
-    VALUES ($1, $2, $3)
+    INSERT INTO work_totals (user_id, username, total_seconds, mood_score)
+    VALUES ($1, $2, $3, 0)
     ON CONFLICT (user_id)
     DO UPDATE SET
       total_seconds = work_totals.total_seconds + $3,
@@ -114,13 +182,38 @@ async function addWork(userId, username, sec) {
   );
 }
 
+async function addMood(userId, username, score) {
+  await pool.query(
+    `
+    INSERT INTO work_totals (user_id, username, total_seconds, mood_score)
+    VALUES ($1, $2, 0, $3)
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      mood_score = work_totals.mood_score + $3,
+      username = $2
+    `,
+    [userId, username, score]
+  );
+}
+
+async function resetMood(userId) {
+  await pool.query(
+    `
+    UPDATE work_totals
+    SET mood_score = 0
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
+}
+
 async function clearWork(userId) {
   await pool.query(`DELETE FROM work_totals WHERE user_id = $1`, [userId]);
 }
 
 async function getRankingEmbed() {
   const result = await pool.query(`
-    SELECT user_id, username, total_seconds
+    SELECT user_id, username, total_seconds, mood_score
     FROM work_totals
     ORDER BY total_seconds DESC
     LIMIT 10
@@ -141,9 +234,21 @@ async function getRankingEmbed() {
 
   for (let i = 0; i < result.rows.length; i++) {
     const row = result.rows[i];
-    const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`;
+    const medal =
+      i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`;
 
-    description += `${medal} <@${row.user_id}>｜${formatTime(row.total_seconds)}\n`;
+    description += `${medal} <@${row.user_id}>｜${formatTime(
+      row.total_seconds
+    )}\n`;
+
+    if (i === 0) {
+      description += `💭 ${getMoodText(
+        row.mood_score,
+        row.username
+      )}（心情指數：${row.mood_score}）\n`;
+    }
+
+    description += "\n";
   }
 
   embed.setDescription(description);
@@ -171,7 +276,6 @@ async function getWorkingEmbed() {
   let description = "";
 
   for (const [userId, start] of workStartTimes) {
-    const user = await client.users.fetch(userId);
     const sec = Math.floor((Date.now() - start) / 1000);
     description += `👤 <@${userId}>｜${formatTime(sec)}\n`;
   }
@@ -232,7 +336,7 @@ function getPanel() {
   return { embeds: [embed], components: [row] };
 }
 
-async function startWork(userId, username) {
+async function startWork(userId) {
   workStartTimes.set(userId, Date.now());
   return getRandom(workReplies);
 }
@@ -275,8 +379,14 @@ client.once(Events.ClientReady, async () => {
       CREATE TABLE IF NOT EXISTS work_totals (
         user_id TEXT PRIMARY KEY,
         username TEXT,
-        total_seconds BIGINT DEFAULT 0
+        total_seconds BIGINT DEFAULT 0,
+        mood_score INT DEFAULT 0
       );
+    `);
+
+    await pool.query(`
+      ALTER TABLE work_totals
+      ADD COLUMN IF NOT EXISTS mood_score INT DEFAULT 0;
     `);
 
     console.log("資料表確認完成");
@@ -289,13 +399,35 @@ client.once(Events.ClientReady, async () => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (!interaction.isButton()) return;
+
+    if (interaction.customId.startsWith("mood:")) {
+      const [, targetUserId, scoreText] = interaction.customId.split(":");
+      const score = Number(scoreText);
+
+      if (interaction.user.id !== targetUserId) {
+        await interaction.reply({
+          content: "這不是你的心情評分按鈕喔～",
+          ephemeral: true,
+        });
+        return;
+      }
+
+      await addMood(interaction.user.id, interaction.user.username, score);
+
+      await interaction.update({
+        content: `已記錄你的工作心情：${score > 0 ? "+" : ""}${score}`,
+        components: [],
+      });
+      return;
+    }
+
     if (!isAllowedChannel(interaction.channelId)) return;
 
     const userId = interaction.user.id;
     const username = interaction.user.username;
 
     if (interaction.customId === "wt_start") {
-      const text = await startWork(userId, username);
+      const text = await startWork(userId);
 
       await interaction.reply({
         content: `${interaction.user} ${text}`,
@@ -311,6 +443,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         content: `${interaction.user} ${result.text}`,
         ephemeral: false,
       });
+
+      if (result.ok) {
+        await interaction.followUp({
+          content:
+            "今天工作感覺如何？請選擇一個心情評分：\n😄 良好 +2｜🙂 還行 +1｜😐 沒啥 0｜😵 超爛 -1｜💀 爛透了 -2",
+          components: [getMoodButtons(userId)],
+          ephemeral: true,
+        });
+      }
+
       return;
     }
 
@@ -337,7 +479,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.customId === "wt_help") {
       await interaction.reply({
         content:
-          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!wt add worktime @人 秒數`\n`!wt clear worktime @人`\n`!強制上班 @人`\n`!強制下班 @人`",
+          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!wt add worktime @人 秒數`\n`!wt clear worktime @人`\n`!wt add workmood @人 指數`\n`!wt remove workmood @人`\n`!強制上班 @人`\n`!強制下班 @人`",
         ephemeral: true,
       });
       return;
@@ -358,14 +500,24 @@ client.on("messageCreate", async (msg) => {
     const now = Date.now();
 
     if (c.toUpperCase() === "Y") {
-      const p = clearConfirmations.get(uid);
-      if (!p) return;
+      const clearPending = clearConfirmations.get(uid);
+      const moodPending = moodResetConfirmations.get(uid);
 
-      await clearWork(p.id);
-      clearConfirmations.delete(uid);
+      if (clearPending) {
+        await clearWork(clearPending.id);
+        clearConfirmations.delete(uid);
 
-      msg.reply(`已清除 ${p.name} 的排行榜紀錄。`);
-      return;
+        msg.reply(`已清除 ${clearPending.name} 的排行榜紀錄。`);
+        return;
+      }
+
+      if (moodPending) {
+        await resetMood(moodPending.id);
+        moodResetConfirmations.delete(uid);
+
+        msg.reply(`已重置 ${moodPending.name} 的心情指數為 0。`);
+        return;
+      }
     }
 
     if (c === "!面板" || c === "!幫助") {
@@ -415,6 +567,37 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
+    if (c.startsWith("!wt add workmood")) {
+      const u = msg.mentions.users.first();
+      const score = Number(c.split(/\s+/)[4]);
+
+      if (!u || !Number.isFinite(score)) {
+        msg.reply("格式錯誤：`!wt add workmood @人 指數`");
+        return;
+      }
+
+      await addMood(u.id, u.username, score);
+      msg.reply(`已為 ${u.username} 增加心情指數 ${score > 0 ? "+" : ""}${score}。`);
+      return;
+    }
+
+    if (c.startsWith("!wt remove workmood")) {
+      const u = msg.mentions.users.first();
+
+      if (!u) {
+        msg.reply("格式錯誤：`!wt remove workmood @人`");
+        return;
+      }
+
+      moodResetConfirmations.set(uid, {
+        id: u.id,
+        name: u.username,
+      });
+
+      msg.reply(`⚠️ 即將重置 ${u.username} 的心情指數為 0，請輸入 \`Y\` 確認。`);
+      return;
+    }
+
     if (c.startsWith("!強制上班")) {
       const u = msg.mentions.users.first();
       if (!u) {
@@ -436,11 +619,16 @@ client.on("messageCreate", async (msg) => {
 
       const result = await endWork(u.id, u.username);
       msg.reply(`${u.username} ${result.text}`);
+
+      if (result.ok) {
+        await sendMoodPrompt(u);
+      }
+
       return;
     }
 
     if (isStart(c)) {
-      const text = await startWork(uid, msg.author.username);
+      const text = await startWork(uid);
       msg.reply(`${msg.author} ${text}`);
       return;
     }
@@ -448,6 +636,10 @@ client.on("messageCreate", async (msg) => {
     if (isEnd(c)) {
       const result = await endWork(uid, msg.author.username);
       msg.reply(`${msg.author} ${result.text}`);
+
+      if (result.ok) {
+        await sendMoodPrompt(msg.author);
+      }
     }
   } catch (error) {
     console.error("處理訊息時發生錯誤：", error);

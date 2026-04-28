@@ -95,6 +95,22 @@ function getTitle(level) {
   return "社會新鮮人";
 }
 
+function getTitleColor(level) {
+  if (level >= 100) return 0xf1c40f;
+  if (level >= 90) return 0x1abc9c;
+  if (level >= 80) return 0x95a5a6;
+  if (level >= 70) return 0x9b59b6;
+  if (level >= 60) return 0xe67e22;
+  if (level >= 50) return 0x34495e;
+  if (level >= 40) return 0xe74c3c;
+  if (level >= 30) return 0x3498db;
+  if (level >= 20) return 0x2980b9;
+  if (level >= 10) return 0x2ecc71;
+  if (level >= 5) return 0x27ae60;
+  if (level >= 1) return 0x7f8c8d;
+  return 0x95a5a6;
+}
+
 function isAllowedChannel(id) {
   if (process.env.CHANNEL_IDS) {
     return process.env.CHANNEL_IDS
@@ -107,7 +123,7 @@ function isAllowedChannel(id) {
 
 function isQuestion(t) {
   return (
-    /[?？嗎嘛呢喔欸]$/.test(t) ||
+    /[?？嗎嘛呢喔]$/.test(t) ||
     t.includes("幾點") ||
     t.includes("什麼時候")
   );
@@ -275,6 +291,7 @@ async function getSelfStatusEmbed(user) {
 
   const embed = new EmbedBuilder()
     .setTitle(`👤 ${user.username} 的打工狀態`)
+    .setColor(getTitleColor(levelInfo.level))
     .setThumbnail(user.displayAvatarURL({ size: 256 }))
     .addFields(
       {
@@ -337,6 +354,9 @@ async function getRankingEmbed() {
     embed.setDescription("目前還沒有排行榜資料。");
     return embed;
   }
+
+  const topLevelInfo = getLevelInfo(Number(result.rows[0].total_seconds));
+  embed.setColor(getTitleColor(topLevelInfo.level));
 
   let description = "";
 
@@ -657,10 +677,20 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    if (c === "!查詢") {
-      const embed = await getWorkingEmbed();
-      msg.reply({ embeds: [embed] });
-      return;
+    if (c.startsWith("!查詢")) {
+      const targetUser = msg.mentions.users.first();
+
+      if (targetUser) {
+        const embed = await getSelfStatusEmbed(targetUser);
+        msg.reply({ embeds: [embed] });
+        return;
+      }
+
+      if (c === "!查詢") {
+        const embed = await getWorkingEmbed();
+        msg.reply({ embeds: [embed] });
+        return;
+      }
     }
 
     if (c === "!排行榜") {

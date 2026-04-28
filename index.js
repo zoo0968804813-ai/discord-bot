@@ -123,8 +123,10 @@ function isAllowedChannel(id) {
 
 function isQuestion(t) {
   return (
-    /[?？嗎嘛呢喔]$/.test(t) ||
+    /[?？嗎嘛呢喔欸诶ㄛㄟ]$/.test(t) ||
     t.includes("幾點") ||
+    t.includes("沒有") ||
+    t.includes("是否") ||
     t.includes("什麼時候")
   );
 }

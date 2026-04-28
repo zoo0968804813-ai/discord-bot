@@ -66,6 +66,19 @@ function formatTime(sec) {
   return `${h}小時${m}分${s}秒`;
 }
 
+function getLevelInfo(totalSeconds) {
+  const totalHours = totalSeconds / 3600;
+  const level = Math.floor(totalHours / 5);
+  const currentLevelHours = totalHours % 5;
+  const percent = Math.floor((currentLevelHours / 5) * 100);
+
+  const filled = Math.floor(percent / 10);
+  const empty = 10 - filled;
+  const bar = "█".repeat(filled) + "░".repeat(empty);
+
+  return { level, percent, bar };
+}
+
 function isAllowedChannel(id) {
   if (process.env.CHANNEL_IDS) {
     return process.env.CHANNEL_IDS
@@ -211,6 +224,79 @@ async function clearWork(userId) {
   await pool.query(`DELETE FROM work_totals WHERE user_id = $1`, [userId]);
 }
 
+async function getUserTotalData(userId) {
+  const result = await pool.query(
+    `
+    SELECT total_seconds, mood_score
+    FROM work_totals
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
+
+  return result.rows[0] || {
+    total_seconds: 0,
+    mood_score: 0,
+  };
+}
+
+async function getSelfStatusEmbed(user) {
+  const data = await getUserTotalData(user.id);
+
+  const savedSeconds = Number(data.total_seconds) || 0;
+  const moodScore = Number(data.mood_score) || 0;
+
+  const startTime = workStartTimes.get(user.id);
+  const isWorking = Boolean(startTime);
+
+  const currentWorkSeconds = isWorking
+    ? Math.floor((Date.now() - startTime) / 1000)
+    : 0;
+
+  const totalWithCurrent = savedSeconds + currentWorkSeconds;
+  const levelInfo = getLevelInfo(totalWithCurrent);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`👤 ${user.username} 的打工狀態`)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .addFields(
+      {
+        name: "目前狀態",
+        value: isWorking ? "🟢 上班中" : "⚪ 目前未上班",
+        inline: true,
+      },
+      {
+        name: "總工作時長",
+        value: formatTime(totalWithCurrent),
+        inline: true,
+      },
+      {
+        name: "目前上班時長",
+        value: isWorking ? formatTime(currentWorkSeconds) : "目前沒有正在上班",
+        inline: false,
+      },
+      {
+        name: "等級",
+        value: `Lv.${levelInfo.level}　${levelInfo.percent}%`,
+        inline: true,
+      },
+      {
+        name: "經驗條",
+        value: `\`${levelInfo.bar}\``,
+        inline: false,
+      },
+      {
+        name: "目前上班心情",
+        value: `${getMoodText(moodScore, user.username)}\n心情指數：${moodScore}`,
+        inline: false,
+      }
+    )
+    .setFooter({ text: "每 5 小時升 1 等" })
+    .setTimestamp();
+
+  return embed;
+}
+
 async function getRankingEmbed() {
   const result = await pool.query(`
     SELECT user_id, username, total_seconds, mood_score
@@ -237,9 +323,11 @@ async function getRankingEmbed() {
     const medal =
       i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`;
 
+    const levelInfo = getLevelInfo(Number(row.total_seconds));
+
     description += `${medal} <@${row.user_id}>｜${formatTime(
       row.total_seconds
-    )}\n`;
+    )}｜Lv.${levelInfo.level}\n`;
 
     if (i === 0) {
       description += `💭 ${getMoodText(
@@ -295,13 +383,14 @@ function getPanel() {
         "🔴 **下班**：結束本次上班並加入排行榜",
         "📋 **查詢**：查看目前誰正在上班",
         "🏆 **排行榜**：查看總工時排名",
+        "👤 **我的狀態**：查看自己的等級、經驗、心情與上班狀態",
         "❔ **幫助**：查看所有指令",
       ].join("\n")
     )
     .setFooter({ text: "WorkTime Bot Control Panel" })
     .setTimestamp();
 
-  const row = new ActionRowBuilder().addComponents(
+  const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId("wt_start")
       .setLabel("上班")
@@ -324,7 +413,15 @@ function getPanel() {
       .setCustomId("wt_rank")
       .setLabel("排行榜")
       .setEmoji("🏆")
-      .setStyle(ButtonStyle.Secondary),
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_status")
+      .setLabel("我的狀態")
+      .setEmoji("👤")
+      .setStyle(ButtonStyle.Primary),
 
     new ButtonBuilder()
       .setCustomId("wt_help")
@@ -333,7 +430,7 @@ function getPanel() {
       .setStyle(ButtonStyle.Secondary)
   );
 
-  return { embeds: [embed], components: [row] };
+  return { embeds: [embed], components: [row1, row2] };
 }
 
 async function startWork(userId) {
@@ -476,6 +573,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (interaction.customId === "wt_status") {
+      const embed = await getSelfStatusEmbed(interaction.user);
+
+      await interaction.reply({
+        embeds: [embed],
+        ephemeral: true,
+      });
+      return;
+    }
+
     if (interaction.customId === "wt_help") {
       await interaction.reply({
         content:
@@ -533,6 +640,12 @@ client.on("messageCreate", async (msg) => {
 
     if (c === "!排行榜") {
       const embed = await getRankingEmbed();
+      msg.reply({ embeds: [embed] });
+      return;
+    }
+
+    if (c === "!我的狀態") {
+      const embed = await getSelfStatusEmbed(msg.author);
       msg.reply({ embeds: [embed] });
       return;
     }

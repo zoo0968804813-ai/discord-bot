@@ -390,45 +390,47 @@ function getPanel() {
     .setFooter({ text: "WorkTime Bot Control Panel" })
     .setTimestamp();
 
-  const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("wt_start")
-      .setLabel("上班")
-      .setEmoji("🟢")
-      .setStyle(ButtonStyle.Success),
+const row1 = new ActionRowBuilder().addComponents(
+  new ButtonBuilder()
+    .setCustomId("wt_start")
+    .setLabel("上班")
+    .setEmoji("🟢")
+    .setStyle(ButtonStyle.Success),
 
-    new ButtonBuilder()
-      .setCustomId("wt_end")
-      .setLabel("下班")
-      .setEmoji("🔴")
-      .setStyle(ButtonStyle.Danger),
+  new ButtonBuilder()
+    .setCustomId("wt_end")
+    .setLabel("下班")
+    .setEmoji("🔴")
+    .setStyle(ButtonStyle.Danger),
 
-    new ButtonBuilder()
-      .setCustomId("wt_query")
-      .setLabel("查詢")
-      .setEmoji("📋")
-      .setStyle(ButtonStyle.Primary),
+  new ButtonBuilder()
+    .setCustomId("wt_query")
+    .setLabel("查詢")
+    .setEmoji("📋")
+    .setStyle(ButtonStyle.Primary),
 
-    new ButtonBuilder()
-      .setCustomId("wt_rank")
-      .setLabel("排行榜")
-      .setEmoji("🏆")
-      .setStyle(ButtonStyle.Secondary)
-  );
+  // 👇 改到這裡（我的狀態上來）
+  new ButtonBuilder()
+    .setCustomId("wt_status")
+    .setLabel("我的狀態")
+    .setEmoji("👤")
+    .setStyle(ButtonStyle.Primary)
+);
 
-  const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId("wt_status")
-      .setLabel("我的狀態")
-      .setEmoji("👤")
-      .setStyle(ButtonStyle.Primary),
+const row2 = new ActionRowBuilder().addComponents(
+  // 👇 排行榜下去
+  new ButtonBuilder()
+    .setCustomId("wt_rank")
+    .setLabel("排行榜")
+    .setEmoji("🏆")
+    .setStyle(ButtonStyle.Secondary),
 
-    new ButtonBuilder()
-      .setCustomId("wt_help")
-      .setLabel("幫助")
-      .setEmoji("❔")
-      .setStyle(ButtonStyle.Secondary)
-  );
+  new ButtonBuilder()
+    .setCustomId("wt_help")
+    .setLabel("幫助")
+    .setEmoji("❔")
+    .setStyle(ButtonStyle.Secondary)
+);
 
   return { embeds: [embed], components: [row1, row2] };
 }

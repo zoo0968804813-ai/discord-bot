@@ -79,6 +79,22 @@ function getLevelInfo(totalSeconds) {
   return { level, percent, bar };
 }
 
+function getTitle(level) {
+  if (level >= 100) return "公司守護神";
+  if (level >= 90) return "摸魚大宗師";
+  if (level >= 80) return "部門活化石";
+  if (level >= 70) return "甩鍋藝術家";
+  if (level >= 60) return "報告製造機";
+  if (level >= 50) return "專案邊緣人";
+  if (level >= 40) return "資深救火隊";
+  if (level >= 30) return "會議記錄員";
+  if (level >= 20) return "職場工具人";
+  if (level >= 10) return "鍵盤敲擊工";
+  if (level >= 5) return "茶水間萌新";
+  if (level >= 1) return "職場新鮮人";
+  return "社會新鮮人";
+}
+
 function isAllowedChannel(id) {
   if (process.env.CHANNEL_IDS) {
     return process.env.CHANNEL_IDS
@@ -91,7 +107,7 @@ function isAllowedChannel(id) {
 
 function isQuestion(t) {
   return (
-    /[?？嗎嘛呢喔]$/.test(t) ||
+    /[?？嗎嘛呢喔欸]$/.test(t) ||
     t.includes("幾點") ||
     t.includes("什麼時候")
   );
@@ -255,6 +271,7 @@ async function getSelfStatusEmbed(user) {
 
   const totalWithCurrent = savedSeconds + currentWorkSeconds;
   const levelInfo = getLevelInfo(totalWithCurrent);
+  const title = getTitle(levelInfo.level);
 
   const embed = new EmbedBuilder()
     .setTitle(`👤 ${user.username} 的打工狀態`)
@@ -278,6 +295,11 @@ async function getSelfStatusEmbed(user) {
       {
         name: "等級",
         value: `Lv.${levelInfo.level}　${levelInfo.percent}%`,
+        inline: true,
+      },
+      {
+        name: "稱號",
+        value: title,
         inline: true,
       },
       {
@@ -324,10 +346,11 @@ async function getRankingEmbed() {
       i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`;
 
     const levelInfo = getLevelInfo(Number(row.total_seconds));
+    const title = getTitle(levelInfo.level);
 
     description += `${medal} <@${row.user_id}>｜${formatTime(
       row.total_seconds
-    )}｜Lv.${levelInfo.level}\n`;
+    )}｜Lv.${levelInfo.level}｜${title}\n`;
 
     if (i === 0) {
       description += `💭 ${getMoodText(
@@ -588,7 +611,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.customId === "wt_help") {
       await interaction.reply({
         content:
-          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!wt add worktime @人 秒數`\n`!wt clear worktime @人`\n`!wt add workmood @人 指數`\n`!wt clear workmood @人`\n`!強制上班 @人`\n`!強制下班 @人`",
+          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!wt add worktime @人 秒數`\n`!wt remove worktime @人`\n`!wt add workmood @人 指數`\n`!wt remove workmood @人`\n`!強制上班 @人`\n`!強制下班 @人`",
         ephemeral: true,
       });
       return;
@@ -666,10 +689,10 @@ client.on("messageCreate", async (msg) => {
       return;
     }
 
-    if (c.startsWith("!wt clear worktime")) {
+    if (c.startsWith("!wt remove worktime")) {
       const u = msg.mentions.users.first();
       if (!u) {
-        msg.reply("格式錯誤：`!wt clear worktime @人`");
+        msg.reply("格式錯誤：`!wt remove worktime @人`");
         return;
       }
 

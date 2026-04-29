@@ -31,6 +31,10 @@ const clearConfirmations = new Map();
 const moodResetConfirmations = new Map();
 const coinClearConfirmations = new Map();
 
+let panelRefreshTimer = null;
+let panelNextRefreshAt = null;
+const PANEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+
 const workReplies = [
   "又是辛勤工作的一天呢！上班要加油窩～ 💖！",
   "努力奮鬥打工人！！打工才是人上人！！",
@@ -130,7 +134,7 @@ function isAdmin(member) {
 
 function isQuestion(t) {
   return (
-    /[?？嗎嘛呢喔欸诶ㄛㄟ]$/.test(t) ||
+    /[?？嗎嘛呢喔欸了诶ㄛㄟ]$/.test(t) ||
     t.includes("幾點") ||
     t.includes("沒有") ||
     t.includes("是否") ||
@@ -561,6 +565,87 @@ const row2 = new ActionRowBuilder().addComponents(
   return { embeds: [embed], components: [row1, row2] };
 }
 
+async function clearPanelChannelMessages(channel) {
+  let deletedTotal = 0;
+
+  while (true) {
+    const messages = await channel.messages.fetch({ limit: 100 });
+
+    if (messages.size === 0) break;
+
+    const deleted = await channel.bulkDelete(messages, true).catch((error) => {
+      console.error("清除面板頻道訊息時發生錯誤：", error);
+      return null;
+    });
+
+    if (!deleted || deleted.size === 0) break;
+
+    deletedTotal += deleted.size;
+
+    if (messages.size < 100) break;
+  }
+
+  return deletedTotal;
+}
+
+async function refreshPanelChannel() {
+  const panelChannelId = process.env.PANEL_CHANNEL_ID;
+
+  if (!panelChannelId) {
+    console.log("未設定 PANEL_CHANNEL_ID，略過自動刷新面板。");
+    return;
+  }
+
+  const channel = await client.channels.fetch(panelChannelId).catch((error) => {
+    console.error("取得面板頻道失敗：", error);
+    return null;
+  });
+
+  if (!channel || !channel.isTextBased()) {
+    console.error("PANEL_CHANNEL_ID 指定的頻道無效或不是文字頻道。");
+    return;
+  }
+
+  const deletedTotal = await clearPanelChannelMessages(channel);
+  await channel.send(getPanel());
+
+  console.log(`面板頻道已刷新，刪除 ${deletedTotal} 則訊息並重新發送面板。`);
+}
+
+function startPanelRefreshTimer() {
+  if (panelRefreshTimer) {
+    clearInterval(panelRefreshTimer);
+  }
+
+  panelNextRefreshAt = Date.now() + PANEL_REFRESH_INTERVAL_MS;
+
+  panelRefreshTimer = setInterval(async () => {
+    try {
+      await refreshPanelChannel();
+      panelNextRefreshAt = Date.now() + PANEL_REFRESH_INTERVAL_MS;
+    } catch (error) {
+      console.error("自動刷新面板時發生錯誤：", error);
+      panelNextRefreshAt = Date.now() + PANEL_REFRESH_INTERVAL_MS;
+    }
+  }, PANEL_REFRESH_INTERVAL_MS);
+}
+
+async function resetPanelRefreshTimerAndRunNow() {
+  await refreshPanelChannel();
+  startPanelRefreshTimer();
+}
+
+function getPanelRefreshRemainingText() {
+  if (!panelNextRefreshAt) {
+    return "目前尚未啟動面板自動刷新計時器。";
+  }
+
+  const remainingMs = Math.max(0, panelNextRefreshAt - Date.now());
+  const totalSeconds = Math.floor(remainingMs / 1000);
+
+  return `距離下一次面板清空與重發還剩：${formatTime(totalSeconds)}`;
+}
+
 async function startWork(userId, username) {
   const startTime = Date.now();
 
@@ -639,6 +724,9 @@ client.once(Events.ClientReady, async () => {
     await loadActiveSessions();
 
     console.log("資料表確認完成");
+
+    await refreshPanelChannel();
+    startPanelRefreshTimer();
   } catch (error) {
     console.error("資料表確認失敗：", error);
   }
@@ -825,6 +913,27 @@ if (clearPending || moodPending || coinPending) {
     if (c === "!我的狀態") {
       const embed = await getSelfStatusEmbed(msg.author);
       msg.reply({ embeds: [embed] });
+      return;
+    }
+
+    if (c === "!wt panel timer") {
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+
+      msg.reply(getPanelRefreshRemainingText());
+      return;
+    }
+
+    if (c === "!wt refresh panel") {
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+
+      await resetPanelRefreshTimerAndRunNow();
+      msg.reply("已立即刷新面板頻道，並重新開始 1 小時計時器。");
       return;
     }
 

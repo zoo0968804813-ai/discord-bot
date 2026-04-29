@@ -9,6 +9,8 @@ const {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  PermissionsBitField,
+  MessageFlags,
 } = require("discord.js");
 
 const pool = new Pool({
@@ -27,6 +29,7 @@ const client = new Client({
 const workStartTimes = new Map();
 const clearConfirmations = new Map();
 const moodResetConfirmations = new Map();
+const coinClearConfirmations = new Map();
 
 const workReplies = [
   "又是辛勤工作的一天呢！上班要加油窩～ 💖！",
@@ -119,6 +122,10 @@ function isAllowedChannel(id) {
       .includes(id);
   }
   return id === process.env.CHANNEL_ID;
+}
+
+function isAdmin(member) {
+  return member.permissions.has(PermissionsBitField.Flags.Administrator);
 }
 
 function isQuestion(t) {
@@ -215,25 +222,67 @@ async function sendMoodPrompt(user) {
   }
 }
 
-async function addWork(userId, username, sec) {
+async function saveActiveSession(userId, username, startTime) {
   await pool.query(
     `
-    INSERT INTO work_totals (user_id, username, total_seconds, mood_score)
-    VALUES ($1, $2, $3, 0)
+    INSERT INTO active_work_sessions (user_id, username, start_time)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      username = $2,
+      start_time = $3
+    `,
+    [userId, username, startTime]
+  );
+}
+
+async function removeActiveSession(userId) {
+  await pool.query(
+    `
+    DELETE FROM active_work_sessions
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
+}
+
+async function loadActiveSessions() {
+  const result = await pool.query(`
+    SELECT user_id, start_time
+    FROM active_work_sessions
+  `);
+
+  workStartTimes.clear();
+
+  for (const row of result.rows) {
+    workStartTimes.set(row.user_id, Number(row.start_time));
+  }
+
+  console.log(`已恢復 ${result.rows.length} 位上班中的打工人`);
+}
+
+async function addWork(userId, username, sec) {
+  const earnedCoins = Math.floor((Number(sec) / 3600) * 10);
+
+  await pool.query(
+    `
+    INSERT INTO work_totals (user_id, username, total_seconds, mood_score, coins)
+    VALUES ($1, $2, $3, 0, $4)
     ON CONFLICT (user_id)
     DO UPDATE SET
       total_seconds = work_totals.total_seconds + $3,
+      coins = work_totals.coins + $4,
       username = $2
     `,
-    [userId, username, sec]
+    [userId, username, sec, earnedCoins]
   );
 }
 
 async function addMood(userId, username, score) {
   await pool.query(
     `
-    INSERT INTO work_totals (user_id, username, total_seconds, mood_score)
-    VALUES ($1, $2, 0, $3)
+    INSERT INTO work_totals (user_id, username, total_seconds, mood_score, coins)
+    VALUES ($1, $2, 0, $3, 0)
     ON CONFLICT (user_id)
     DO UPDATE SET
       mood_score = work_totals.mood_score + $3,
@@ -254,6 +303,31 @@ async function resetMood(userId) {
   );
 }
 
+async function addCoins(userId, username, amount) {
+  await pool.query(
+    `
+    INSERT INTO work_totals (user_id, username, total_seconds, mood_score, coins)
+    VALUES ($1, $2, 0, 0, $3)
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      coins = work_totals.coins + $3,
+      username = $2
+    `,
+    [userId, username, amount]
+  );
+}
+
+async function clearCoins(userId) {
+  await pool.query(
+    `
+    UPDATE work_totals
+    SET coins = 0
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
+}
+
 async function clearWork(userId) {
   await pool.query(`DELETE FROM work_totals WHERE user_id = $1`, [userId]);
 }
@@ -261,7 +335,7 @@ async function clearWork(userId) {
 async function getUserTotalData(userId) {
   const result = await pool.query(
     `
-    SELECT total_seconds, mood_score
+    SELECT total_seconds, mood_score, coins
     FROM work_totals
     WHERE user_id = $1
     `,
@@ -271,6 +345,7 @@ async function getUserTotalData(userId) {
   return result.rows[0] || {
     total_seconds: 0,
     mood_score: 0,
+    coins: 0,
   };
 }
 
@@ -279,6 +354,7 @@ async function getSelfStatusEmbed(user) {
 
   const savedSeconds = Number(data.total_seconds) || 0;
   const moodScore = Number(data.mood_score) || 0;
+  const coins = Number(data.coins) || 0;
 
   const startTime = workStartTimes.get(user.id);
   const isWorking = Boolean(startTime);
@@ -307,6 +383,11 @@ async function getSelfStatusEmbed(user) {
         inline: true,
       },
       {
+        name: "金幣",
+        value: `🪙 ${coins}`,
+        inline: true,
+      },
+      {
         name: "目前上班時長",
         value: isWorking ? formatTime(currentWorkSeconds) : "目前沒有正在上班",
         inline: false,
@@ -332,7 +413,7 @@ async function getSelfStatusEmbed(user) {
         inline: false,
       }
     )
-    .setFooter({ text: "每 5 小時升 1 等" })
+    .setFooter({ text: "WorkTime Bot Personal Interface" })
     .setTimestamp();
 
   return embed;
@@ -427,8 +508,8 @@ function getPanel() {
         "🟢 **上班**：開始紀錄你的上班時間",
         "🔴 **下班**：結束本次上班並加入排行榜",
         "📋 **查詢**：查看目前誰正在上班",
-        "🏆 **排行榜**：查看總工時排名",
         "👤 **我的狀態**：查看自己的等級、經驗、心情與上班狀態",
+        "🏆 **排行榜**：查看總工時排名",
         "❔ **幫助**：查看所有指令",
       ].join("\n")
     )
@@ -480,8 +561,12 @@ const row2 = new ActionRowBuilder().addComponents(
   return { embeds: [embed], components: [row1, row2] };
 }
 
-async function startWork(userId) {
-  workStartTimes.set(userId, Date.now());
+async function startWork(userId, username) {
+  const startTime = Date.now();
+
+  workStartTimes.set(userId, startTime);
+  await saveActiveSession(userId, username, startTime);
+
   return getRandom(workReplies);
 }
 
@@ -499,6 +584,8 @@ async function endWork(userId, username) {
 
   if (diffMs > 24 * 60 * 60 * 1000) {
     workStartTimes.delete(userId);
+    await removeActiveSession(userId);
+
     return {
       ok: false,
       text: "你的上班紀錄已經超過 24 小時了，這次不計算喔～",
@@ -507,7 +594,9 @@ async function endWork(userId, username) {
 
   const sec = Math.floor(diffMs / 1000);
   await addWork(userId, username, sec);
+
   workStartTimes.delete(userId);
+  await removeActiveSession(userId);
 
   return {
     ok: true,
@@ -524,7 +613,8 @@ client.once(Events.ClientReady, async () => {
         user_id TEXT PRIMARY KEY,
         username TEXT,
         total_seconds BIGINT DEFAULT 0,
-        mood_score INT DEFAULT 0
+        mood_score INT DEFAULT 0,
+        coins BIGINT DEFAULT 0
       );
     `);
 
@@ -532,6 +622,21 @@ client.once(Events.ClientReady, async () => {
       ALTER TABLE work_totals
       ADD COLUMN IF NOT EXISTS mood_score INT DEFAULT 0;
     `);
+
+    await pool.query(`
+      ALTER TABLE work_totals
+      ADD COLUMN IF NOT EXISTS coins BIGINT DEFAULT 0;
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS active_work_sessions (
+        user_id TEXT PRIMARY KEY,
+        username TEXT,
+        start_time BIGINT NOT NULL
+      );
+    `);
+
+    await loadActiveSessions();
 
     console.log("資料表確認完成");
   } catch (error) {
@@ -551,7 +656,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.user.id !== targetUserId) {
         await interaction.reply({
           content: "這不是你的心情評分按鈕喔～",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -571,11 +676,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const username = interaction.user.username;
 
     if (interaction.customId === "wt_start") {
-      const text = await startWork(userId);
+      const text = await startWork(userId, username);
 
       await interaction.reply({
         content: `${interaction.user} ${text}`,
-        ephemeral: false,
       });
       return;
     }
@@ -585,7 +689,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply({
         content: `${interaction.user} ${result.text}`,
-        ephemeral: false,
       });
 
       if (result.ok) {
@@ -593,7 +696,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           content:
             "今天工作感覺如何？請選擇一個心情評分：\n😄 良好 +2｜🙂 還行 +1｜😐 沒啥 0｜😵 超爛 -1｜💀 爛透了 -2",
           components: [getMoodButtons(userId)],
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -605,7 +708,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply({
         embeds: [embed],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -615,7 +718,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply({
         embeds: [embed],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -625,7 +728,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply({
         embeds: [embed],
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -633,8 +736,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.customId === "wt_help") {
       await interaction.reply({
         content:
-          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!wt add worktime @人 秒數`\n`!wt remove worktime @人`\n`!wt add workmood @人 指數`\n`!wt remove workmood @人`\n`!強制上班 @人`\n`!強制下班 @人`",
-        ephemeral: true,
+          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!我的狀態`\n`!wt add worktime @人 秒數` [僅提供開發Debug使用]\n`!wt remove worktime @人` [僅提供開發Debug使用]\n`!wt add workmood @人 指數` [僅提供開發Debug使用]\n`!wt remove workmood @人` [僅提供開發Debug使用]\n`!wt add coin @人 數量` [僅提供開發Debug使用]\n`!wt remove coin @人` [僅提供開發Debug使用]\n`!強制上班 @人` [僅提供開發Debug使用]\n`!強制下班 @人` [僅提供開發Debug使用]",
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -655,11 +758,13 @@ client.on("messageCreate", async (msg) => {
 
 const clearPending = clearConfirmations.get(uid);
 const moodPending = moodResetConfirmations.get(uid);
+const coinPending = coinClearConfirmations.get(uid);
 
-if (clearPending || moodPending) {
+if (clearPending || moodPending || coinPending) {
   if (c.toUpperCase() !== "Y") {
     clearConfirmations.delete(uid);
     moodResetConfirmations.delete(uid);
+    coinClearConfirmations.delete(uid);
 
     msg.reply("已取消此次確認操作。");
     return;
@@ -678,6 +783,14 @@ if (clearPending || moodPending) {
     moodResetConfirmations.delete(uid);
 
     msg.reply(`已重置 ${moodPending.name} 的心情指數為 0。`);
+    return;
+  }
+
+  if (coinPending) {
+    await clearCoins(coinPending.id);
+    coinClearConfirmations.delete(uid);
+
+    msg.reply(`已清除 ${coinPending.name} 的金幣。`);
     return;
   }
 }
@@ -716,6 +829,12 @@ if (clearPending || moodPending) {
     }
 
     if (c.startsWith("!wt add worktime")) {
+
+        if (!isAdmin(msg.member)) {
+          msg.reply("你沒有權限使用這個指令。");
+          return;
+        }
+
       const u = msg.mentions.users.first();
       const sec = Number(c.split(/\s+/)[4]);
 
@@ -724,12 +843,29 @@ if (clearPending || moodPending) {
         return;
       }
 
-      await addWork(u.id, u.username, sec);
-      msg.reply(`已為 ${u.username} 增加 ${formatTime(sec)} 總工時。`);
+      const currentStartTime = workStartTimes.get(u.id);
+
+      if (!currentStartTime) {
+        msg.reply("這位打工人目前沒有上班紀錄ㄛ！");
+        return;
+      }
+
+      const newStartTime = currentStartTime - sec * 1000;
+
+      workStartTimes.set(u.id, newStartTime);
+      await saveActiveSession(u.id, u.username, newStartTime);
+
+      msg.reply(`已為 ${u.username} 的本次上班時間增加 ${formatTime(sec)}。`);
       return;
     }
 
     if (c.startsWith("!wt remove worktime")) {
+
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+
       const u = msg.mentions.users.first();
       if (!u) {
         msg.reply("格式錯誤：`!wt remove worktime @人`");
@@ -746,6 +882,12 @@ if (clearPending || moodPending) {
     }
 
     if (c.startsWith("!wt add workmood")) {
+
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+
       const u = msg.mentions.users.first();
       const score = Number(c.split(/\s+/)[4]);
 
@@ -760,6 +902,12 @@ if (clearPending || moodPending) {
     }
 
     if (c.startsWith("!wt remove workmood")) {
+
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+
       const u = msg.mentions.users.first();
 
       if (!u) {
@@ -776,19 +924,78 @@ if (clearPending || moodPending) {
       return;
     }
 
+    if (c.startsWith("!wt add coin")) {
+
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+
+      const u = msg.mentions.users.first();
+      const amount = Number(c.split(/\s+/)[4]);
+
+      if (!u || !Number.isFinite(amount) || amount <= 0) {
+        msg.reply("格式錯誤：`!wt add coin @人 數量`");
+        return;
+      }
+
+      await addCoins(u.id, u.username, amount);
+      msg.reply(`已為 ${u.username} 增加 🪙 ${amount} 金幣。`);
+      return;
+    }
+
+    if (c.startsWith("!wt remove coin")) {
+
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+
+      const u = msg.mentions.users.first();
+
+      if (!u) {
+        msg.reply("格式錯誤：`!wt remove coin @人`");
+        return;
+      }
+
+      coinClearConfirmations.set(uid, {
+        id: u.id,
+        name: u.username,
+      });
+
+      msg.reply(`⚠️ 即將清除 ${u.username} 的金幣，請輸入 \`Y\` 確認。`);
+      return;
+    }
+
     if (c.startsWith("!強制上班")) {
+
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+      
       const u = msg.mentions.users.first();
       if (!u) {
         msg.reply("格式錯誤：`!強制上班 @人`");
         return;
       }
 
-      workStartTimes.set(u.id, now);
+      const startTime = now;
+
+      workStartTimes.set(u.id, startTime);
+      await saveActiveSession(u.id, u.username, startTime);
+
       msg.reply(`${u.username} 已被強制設定為上班中。`);
       return;
     }
 
     if (c.startsWith("!強制下班")) {
+
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+
       const u = msg.mentions.users.first();
       if (!u) {
         msg.reply("格式錯誤：`!強制下班 @人`");
@@ -806,7 +1013,7 @@ if (clearPending || moodPending) {
     }
 
     if (isStart(c)) {
-      const text = await startWork(uid);
+      const text = await startWork(uid, msg.author.username);
       msg.reply(`${msg.author} ${text}`);
       return;
     }

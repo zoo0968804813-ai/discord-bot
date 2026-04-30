@@ -35,6 +35,9 @@ let panelRefreshTimer = null;
 let panelNextRefreshAt = null;
 const PANEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 
+let rankingRewardTimer = null;
+const RANKING_REWARD_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+
 const workReplies = [
   "又是辛勤工作的一天呢！上班要加油窩～ 💖！",
   "努力奮鬥打工人！！打工才是人上人！！",
@@ -159,6 +162,81 @@ function isEnd(t) {
   return t.includes("下班") && !isQuestion(t) && !isOther(t);
 }
 
+function pad2(num) {
+  return String(num).padStart(2, "0");
+}
+
+function getTaipeiDate(date = new Date()) {
+  return new Date(date.getTime() + 8 * 60 * 60 * 1000);
+}
+
+function getMonthlyPeriodKey(date = new Date()) {
+  const taipei = getTaipeiDate(date);
+  const year = taipei.getUTCFullYear();
+  const month = pad2(taipei.getUTCMonth() + 1);
+
+  return `${year}-${month}`;
+}
+
+function getPreviousMonthlyPeriodKey(date = new Date()) {
+  const taipei = getTaipeiDate(date);
+  let year = taipei.getUTCFullYear();
+  let month = taipei.getUTCMonth();
+
+  if (month === 0) {
+    year -= 1;
+    month = 12;
+  }
+
+  return `${year}-${pad2(month)}`;
+}
+
+function getWeeklyStartDate(date = new Date()) {
+  const taipei = getTaipeiDate(date);
+  const year = taipei.getUTCFullYear();
+  const month = taipei.getUTCMonth();
+  const day = taipei.getUTCDate();
+  const weekDay = taipei.getUTCDay();
+  const mondayOffset = (weekDay + 6) % 7;
+
+  return new Date(Date.UTC(year, month, day - mondayOffset));
+}
+
+function formatDateKey(date) {
+  return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(
+    date.getUTCDate()
+  )}`;
+}
+
+function getWeeklyPeriodKey(date = new Date()) {
+  return formatDateKey(getWeeklyStartDate(date));
+}
+
+function getPreviousWeeklyPeriodKey(date = new Date()) {
+  const currentWeekStart = getWeeklyStartDate(date);
+  const previousWeekStart = new Date(
+    currentWeekStart.getTime() - 7 * 24 * 60 * 60 * 1000
+  );
+
+  return formatDateKey(previousWeekStart);
+}
+
+function getMonthlyPeriodLabel(periodKey) {
+  const [year, month] = periodKey.split("-");
+  const lastDay = new Date(Number(year), Number(month), 0).getDate();
+
+  return `${Number(month)}/1 ~ ${Number(month)}/${lastDay}`;
+}
+
+function getWeeklyPeriodLabel(periodKey) {
+  const start = new Date(`${periodKey}T00:00:00Z`);
+  const end = new Date(start.getTime() + 6 * 24 * 60 * 60 * 1000);
+
+  return `${start.getUTCMonth() + 1}/${start.getUTCDate()} ~ ${
+    end.getUTCMonth() + 1
+  }/${end.getUTCDate()}`;
+}
+
 function getMoodText(score, username) {
   const s = Number(score) || 0;
 
@@ -206,6 +284,32 @@ function getMoodButtons(userId) {
       .setLabel("爛透了")
       .setEmoji("💀")
       .setStyle(ButtonStyle.Danger)
+  );
+}
+
+function getRankingButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_rank_month")
+      .setLabel("月排行榜")
+      .setEmoji("📅")
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId("wt_rank_week")
+      .setLabel("週排行榜")
+      .setEmoji("🗓️")
+      .setStyle(ButtonStyle.Primary)
+  );
+}
+
+function getBackToTotalRankingButton() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_rank_total")
+      .setLabel("返回總排行榜")
+      .setEmoji("🏆")
+      .setStyle(ButtonStyle.Secondary)
   );
 }
 
@@ -265,6 +369,35 @@ async function loadActiveSessions() {
   console.log(`已恢復 ${result.rows.length} 位上班中的打工人`);
 }
 
+async function addPeriodWork(userId, username, sec) {
+  const monthlyPeriodKey = getMonthlyPeriodKey();
+  const weeklyPeriodKey = getWeeklyPeriodKey();
+
+  await pool.query(
+    `
+    INSERT INTO work_monthly_totals (period_key, user_id, username, total_seconds)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (period_key, user_id)
+    DO UPDATE SET
+      total_seconds = work_monthly_totals.total_seconds + $4,
+      username = $3
+    `,
+    [monthlyPeriodKey, userId, username, sec]
+  );
+
+  await pool.query(
+    `
+    INSERT INTO work_weekly_totals (period_key, user_id, username, total_seconds)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (period_key, user_id)
+    DO UPDATE SET
+      total_seconds = work_weekly_totals.total_seconds + $4,
+      username = $3
+    `,
+    [weeklyPeriodKey, userId, username, sec]
+  );
+}
+
 async function addWork(userId, username, sec) {
   const earnedCoins = Math.floor((Number(sec) / 3600) * 10);
 
@@ -280,6 +413,8 @@ async function addWork(userId, username, sec) {
     `,
     [userId, username, sec, earnedCoins]
   );
+
+  await addPeriodWork(userId, username, sec);
 }
 
 async function addMood(userId, username, score) {
@@ -336,6 +471,52 @@ async function clearWork(userId) {
   await pool.query(`DELETE FROM work_totals WHERE user_id = $1`, [userId]);
 }
 
+async function getCurrentMonthlyBestEmployee() {
+  const result = await pool.query(
+    `
+    SELECT user_id, username, title
+    FROM current_special_titles
+    WHERE title_key = 'monthly_best_employee'
+    LIMIT 1
+    `
+  );
+
+  return result.rows[0] || null;
+}
+
+async function setCurrentMonthlyBestEmployee(userId, username, periodKey) {
+  await pool.query(
+    `
+    INSERT INTO current_special_titles (title_key, user_id, username, title, awarded_period_key)
+    VALUES ('monthly_best_employee', $1, $2, '本月最佳員工', $3)
+    ON CONFLICT (title_key)
+    DO UPDATE SET
+      user_id = $1,
+      username = $2,
+      title = '本月最佳員工',
+      awarded_period_key = $3
+    `,
+    [userId, username, periodKey]
+  );
+}
+
+async function clearCurrentMonthlyBestEmployee() {
+  await pool.query(
+    `
+    DELETE FROM current_special_titles
+    WHERE title_key = 'monthly_best_employee'
+    `
+  );
+}
+
+function getDisplayTitle(level, userId, monthlyBestEmployee) {
+  if (monthlyBestEmployee && monthlyBestEmployee.user_id === userId) {
+    return "本月最佳員工";
+  }
+
+  return getTitle(level);
+}
+
 async function getUserTotalData(userId) {
   const result = await pool.query(
     `
@@ -355,6 +536,7 @@ async function getUserTotalData(userId) {
 
 async function getSelfStatusEmbed(user) {
   const data = await getUserTotalData(user.id);
+  const monthlyBestEmployee = await getCurrentMonthlyBestEmployee();
 
   const savedSeconds = Number(data.total_seconds) || 0;
   const moodScore = Number(data.mood_score) || 0;
@@ -369,7 +551,7 @@ async function getSelfStatusEmbed(user) {
 
   const totalWithCurrent = savedSeconds + currentWorkSeconds;
   const levelInfo = getLevelInfo(totalWithCurrent);
-  const title = getTitle(levelInfo.level);
+  const title = getDisplayTitle(levelInfo.level, user.id, monthlyBestEmployee);
 
   const embed = new EmbedBuilder()
     .setTitle(`👤 ${user.username} 的打工狀態`)
@@ -442,6 +624,7 @@ async function getRankingEmbed() {
     return embed;
   }
 
+  const monthlyBestEmployee = await getCurrentMonthlyBestEmployee();
   const topLevelInfo = getLevelInfo(Number(result.rows[0].total_seconds));
   embed.setColor(getTitleColor(topLevelInfo.level));
 
@@ -453,7 +636,7 @@ async function getRankingEmbed() {
       i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`;
 
     const levelInfo = getLevelInfo(Number(row.total_seconds));
-    const title = getTitle(levelInfo.level);
+    const title = getDisplayTitle(levelInfo.level, row.user_id, monthlyBestEmployee);
 
     description += `${medal} <@${row.user_id}>｜${formatTime(
       row.total_seconds
@@ -479,6 +662,235 @@ async function getRankingEmbed() {
   }
 
   return embed;
+}
+
+async function getMonthlyRankingEmbed() {
+  const periodKey = getMonthlyPeriodKey();
+
+  const result = await pool.query(
+    `
+    SELECT user_id, username, total_seconds
+    FROM work_monthly_totals
+    WHERE period_key = $1
+    ORDER BY total_seconds DESC
+    LIMIT 10
+    `,
+    [periodKey]
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle("📅 月排行榜")
+    .setDescription(`統計區間：${getMonthlyPeriodLabel(periodKey)}`)
+    .setFooter({ text: "WorkTime Bot Monthly Ranking" })
+    .setTimestamp();
+
+  if (result.rows.length === 0) {
+    embed.setDescription(`統計區間：${getMonthlyPeriodLabel(periodKey)}\n\n目前還沒有月排行榜資料。`);
+    return embed;
+  }
+
+  let description = `統計區間：${getMonthlyPeriodLabel(periodKey)}\n\n`;
+
+  result.rows.forEach((row, index) => {
+    const medal =
+      index === 0 ? "🥇" : index === 1 ? "🥈" : index === 2 ? "🥉" : `#${index + 1}`;
+
+    description += `${medal} <@${row.user_id}>｜${formatTime(row.total_seconds)}\n`;
+  });
+
+  embed.setDescription(description);
+
+  try {
+    const topUser = await client.users.fetch(result.rows[0].user_id);
+    embed.setThumbnail(topUser.displayAvatarURL({ size: 256 }));
+  } catch {
+    // 抓不到頭像時略過
+  }
+
+  return embed;
+}
+
+async function getWeeklyRankingEmbed() {
+  const periodKey = getWeeklyPeriodKey();
+
+  const result = await pool.query(
+    `
+    SELECT user_id, username, total_seconds
+    FROM work_weekly_totals
+    WHERE period_key = $1
+    ORDER BY total_seconds DESC
+    LIMIT 10
+    `,
+    [periodKey]
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle("🗓️ 週排行榜")
+    .setDescription(`統計區間：${getWeeklyPeriodLabel(periodKey)}`)
+    .setFooter({ text: "WorkTime Bot Weekly Ranking" })
+    .setTimestamp();
+
+  if (result.rows.length === 0) {
+    embed.setDescription(`統計區間：${getWeeklyPeriodLabel(periodKey)}\n\n目前還沒有週排行榜資料。`);
+    return embed;
+  }
+
+  let description = `統計區間：${getWeeklyPeriodLabel(periodKey)}\n\n`;
+
+  result.rows.forEach((row, index) => {
+    const medal =
+      index === 0 ? "🥇" : index === 1 ? "🥈" : index === 2 ? "🥉" : `#${index + 1}`;
+
+    description += `${medal} <@${row.user_id}>｜${formatTime(row.total_seconds)}\n`;
+  });
+
+  embed.setDescription(description);
+
+  try {
+    const topUser = await client.users.fetch(result.rows[0].user_id);
+    embed.setThumbnail(topUser.displayAvatarURL({ size: 256 }));
+  } catch {
+    // 抓不到頭像時略過
+  }
+
+  return embed;
+}
+
+async function distributeMonthlyRewards(periodKey) {
+  const alreadyClaimed = await pool.query(
+    `
+    SELECT 1
+    FROM ranking_rewards_claimed
+    WHERE reward_type = 'monthly' AND period_key = $1
+    `,
+    [periodKey]
+  );
+
+  if (alreadyClaimed.rows.length > 0) return;
+
+  const result = await pool.query(
+    `
+    SELECT user_id, username, total_seconds
+    FROM work_monthly_totals
+    WHERE period_key = $1
+    ORDER BY total_seconds DESC
+    LIMIT 3
+    `,
+    [periodKey]
+  );
+
+  if (result.rows.length === 0) {
+    await clearCurrentMonthlyBestEmployee();
+
+    await pool.query(
+      `
+      INSERT INTO ranking_rewards_claimed (reward_type, period_key, claimed_at)
+      VALUES ('monthly', $1, $2)
+      ON CONFLICT (reward_type, period_key) DO NOTHING
+      `,
+      [periodKey, Date.now()]
+    );
+
+    return;
+  }
+
+  const rewards = [500, 300, 200];
+
+  for (let i = 0; i < result.rows.length; i++) {
+    const row = result.rows[i];
+    await addCoins(row.user_id, row.username, rewards[i]);
+  }
+
+  const firstPlace = result.rows[0];
+  await setCurrentMonthlyBestEmployee(firstPlace.user_id, firstPlace.username, periodKey);
+
+  await pool.query(
+    `
+    INSERT INTO ranking_rewards_claimed (reward_type, period_key, claimed_at)
+    VALUES ('monthly', $1, $2)
+    ON CONFLICT (reward_type, period_key) DO NOTHING
+    `,
+    [periodKey, Date.now()]
+  );
+
+  console.log(`已發放 ${periodKey} 月排行榜獎勵。`);
+}
+
+async function distributeWeeklyRewards(periodKey) {
+  const alreadyClaimed = await pool.query(
+    `
+    SELECT 1
+    FROM ranking_rewards_claimed
+    WHERE reward_type = 'weekly' AND period_key = $1
+    `,
+    [periodKey]
+  );
+
+  if (alreadyClaimed.rows.length > 0) return;
+
+  const result = await pool.query(
+    `
+    SELECT user_id, username, total_seconds
+    FROM work_weekly_totals
+    WHERE period_key = $1
+    ORDER BY total_seconds DESC
+    LIMIT 3
+    `,
+    [periodKey]
+  );
+
+  if (result.rows.length === 0) {
+    await pool.query(
+      `
+      INSERT INTO ranking_rewards_claimed (reward_type, period_key, claimed_at)
+      VALUES ('weekly', $1, $2)
+      ON CONFLICT (reward_type, period_key) DO NOTHING
+      `,
+      [periodKey, Date.now()]
+    );
+
+    return;
+  }
+
+  const rewards = [200, 150, 100];
+
+  for (let i = 0; i < result.rows.length; i++) {
+    const row = result.rows[i];
+    await addCoins(row.user_id, row.username, rewards[i]);
+  }
+
+  await pool.query(
+    `
+    INSERT INTO ranking_rewards_claimed (reward_type, period_key, claimed_at)
+    VALUES ('weekly', $1, $2)
+    ON CONFLICT (reward_type, period_key) DO NOTHING
+    `,
+    [periodKey, Date.now()]
+  );
+
+  console.log(`已發放 ${periodKey} 週排行榜獎勵。`);
+}
+
+async function checkAndDistributeRankingRewards() {
+  const previousMonthKey = getPreviousMonthlyPeriodKey();
+  const previousWeekKey = getPreviousWeeklyPeriodKey();
+
+  await distributeMonthlyRewards(previousMonthKey);
+  await distributeWeeklyRewards(previousWeekKey);
+}
+
+function startRankingRewardTimer() {
+  if (rankingRewardTimer) {
+    clearInterval(rankingRewardTimer);
+  }
+
+  rankingRewardTimer = setInterval(async () => {
+    try {
+      await checkAndDistributeRankingRewards();
+    } catch (error) {
+      console.error("檢查週/月排行榜獎勵時發生錯誤：", error);
+    }
+  }, RANKING_REWARD_CHECK_INTERVAL_MS);
 }
 
 async function getWorkingEmbed() {
@@ -721,9 +1133,51 @@ client.once(Events.ClientReady, async () => {
       );
     `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS work_monthly_totals (
+        period_key TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        username TEXT,
+        total_seconds BIGINT DEFAULT 0,
+        PRIMARY KEY (period_key, user_id)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS work_weekly_totals (
+        period_key TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        username TEXT,
+        total_seconds BIGINT DEFAULT 0,
+        PRIMARY KEY (period_key, user_id)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS ranking_rewards_claimed (
+        reward_type TEXT NOT NULL,
+        period_key TEXT NOT NULL,
+        claimed_at BIGINT NOT NULL,
+        PRIMARY KEY (reward_type, period_key)
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS current_special_titles (
+        title_key TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        username TEXT,
+        title TEXT NOT NULL,
+        awarded_period_key TEXT
+      );
+    `);
+
     await loadActiveSessions();
 
     console.log("資料表確認完成");
+
+    await checkAndDistributeRankingRewards();
+    startRankingRewardTimer();
 
     await refreshPanelChannel();
     startPanelRefreshTimer();
@@ -806,7 +1260,38 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply({
         embeds: [embed],
+        components: [getRankingButtons()],
         flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (interaction.customId === "wt_rank_month") {
+      const embed = await getMonthlyRankingEmbed();
+
+      await interaction.update({
+        embeds: [embed],
+        components: [getBackToTotalRankingButton()],
+      });
+      return;
+    }
+
+    if (interaction.customId === "wt_rank_week") {
+      const embed = await getWeeklyRankingEmbed();
+
+      await interaction.update({
+        embeds: [embed],
+        components: [getBackToTotalRankingButton()],
+      });
+      return;
+    }
+
+    if (interaction.customId === "wt_rank_total") {
+      const embed = await getRankingEmbed();
+
+      await interaction.update({
+        embeds: [embed],
+        components: [getRankingButtons()],
       });
       return;
     }

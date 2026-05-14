@@ -11,6 +11,14 @@ const {
   ActionRowBuilder,
   PermissionsBitField,
   MessageFlags,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
 } = require("discord.js");
 
 const pool = new Pool({
@@ -30,6 +38,13 @@ const workStartTimes = new Map();
 const clearConfirmations = new Map();
 const moodResetConfirmations = new Map();
 const coinClearConfirmations = new Map();
+
+const pendingLoanApplications = new Map();
+const pendingRepayments = new Map();
+
+const BANK_OWNER_ID = "495480158648795138";
+const BANK_OWNER_NAME = "Hizu Jin";
+const MAX_LOAN_INSTALLMENTS = 72;
 
 let panelRefreshTimer = null;
 let panelNextRefreshAt = null;
@@ -74,6 +89,10 @@ function formatTime(sec) {
   const m = Math.floor((safeSec % 3600) / 60);
   const s = safeSec % 60;
   return `${h}小時${m}分${s}秒`;
+}
+
+function formatCoins(num) {
+  return `${Number(num || 0).toLocaleString("zh-TW")}`;
 }
 
 function getLevelInfo(totalSeconds) {
@@ -237,6 +256,14 @@ function getWeeklyPeriodLabel(periodKey) {
   }/${end.getUTCDate()}`;
 }
 
+function parsePositiveInteger(value) {
+  const cleaned = String(value || "").replace(/,/g, "").trim();
+  const num = Number(cleaned);
+
+  if (!Number.isInteger(num) || num <= 0) return null;
+  return num;
+}
+
 function getMoodText(score, username) {
   const s = Number(score) || 0;
 
@@ -311,6 +338,149 @@ function getBackToTotalRankingButton() {
       .setEmoji("🏆")
       .setStyle(ButtonStyle.Secondary)
   );
+}
+
+function getBankMainButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_bank_borrow")
+      .setLabel("我要借款")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("wt_bank_repay")
+      .setLabel("我要還款")
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId("wt_bank_query")
+      .setLabel("查詢貸款案件")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function getBankBackButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_bank_borrow")
+      .setLabel("重新申請")
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId("wt_bank_back")
+      .setLabel("返回銀行")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function getLoanConfirmButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_bank_accept_loan")
+      .setLabel("同意對保")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("wt_bank_reject_loan")
+      .setLabel("拒絕對保")
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+function getBackToBankButton() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_bank_back")
+      .setLabel("返回銀行")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function getRepayConfirmButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_bank_confirm_repay")
+      .setLabel("確認還款")
+      .setStyle(ButtonStyle.Success),
+
+    new ButtonBuilder()
+      .setCustomId("wt_bank_cancel_repay")
+      .setLabel("取消還款")
+      .setStyle(ButtonStyle.Danger),
+
+    new ButtonBuilder()
+      .setCustomId("wt_bank_back")
+      .setLabel("返回銀行")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function getLoanCaseButtons() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_bank_repay")
+      .setLabel("我要還款")
+      .setStyle(ButtonStyle.Primary),
+
+    new ButtonBuilder()
+      .setCustomId("wt_bank_back")
+      .setLabel("返回銀行")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function createLoanModal() {
+  const modal = new ModalBuilder()
+    .setCustomId("wt_bank_borrow_modal")
+    .setTitle("Hizu Jin 信託商業銀行");
+
+  const amountInput = new TextInputBuilder()
+    .setCustomId("loan_amount")
+    .setLabel("我想要貸款的金額為...")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setPlaceholder("例如：10000");
+
+  const installmentsInput = new TextInputBuilder()
+    .setCustomId("loan_installments")
+    .setLabel("我想要分期的期數為...")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setPlaceholder("最多72期");
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(amountInput),
+    new ActionRowBuilder().addComponents(installmentsInput)
+  );
+
+  return modal;
+}
+
+function createRepaySelect(remainingInstallments) {
+  const baseOptions = [1, 2, 3, 6, 12].filter(
+    (n) => n <= remainingInstallments
+  );
+
+  const options = baseOptions.map((n) =>
+    new StringSelectMenuOptionBuilder()
+      .setLabel(`還 ${n} 期`)
+      .setValue(String(n))
+      .setDescription(`本次償還 ${n} 期貸款`)
+  );
+
+  options.push(
+    new StringSelectMenuOptionBuilder()
+      .setLabel("一次還清")
+      .setValue(String(remainingInstallments))
+      .setDescription(`一次償還剩餘 ${remainingInstallments} 期`)
+  );
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId("wt_bank_repay_select")
+    .setPlaceholder("請選擇要還幾期")
+    .addOptions(options);
+
+  return new ActionRowBuilder().addComponents(select);
 }
 
 async function sendMoodPrompt(user) {
@@ -532,6 +702,805 @@ async function getUserTotalData(userId) {
     mood_score: 0,
     coins: 0,
   };
+}
+
+async function getBankSettings() {
+  const result = await pool.query(
+    `
+    SELECT setting_key, setting_value
+    FROM bank_settings
+    WHERE setting_key IN ('loan_min_rate', 'loan_max_rate')
+    `
+  );
+
+  const settings = {
+    minRate: 0.5,
+    maxRate: 1,
+  };
+
+  for (const row of result.rows) {
+    if (row.setting_key === "loan_min_rate") {
+      settings.minRate = Number(row.setting_value);
+    }
+
+    if (row.setting_key === "loan_max_rate") {
+      settings.maxRate = Number(row.setting_value);
+    }
+  }
+
+  if (!Number.isFinite(settings.minRate) || settings.minRate <= 0) {
+    settings.minRate = 0.5;
+  }
+
+  if (!Number.isFinite(settings.maxRate) || settings.maxRate < settings.minRate) {
+    settings.maxRate = 1;
+  }
+
+  return settings;
+}
+
+async function setBankRates(minRate, maxRate) {
+  await pool.query(
+    `
+    INSERT INTO bank_settings (setting_key, setting_value)
+    VALUES ('loan_min_rate', $1)
+    ON CONFLICT (setting_key)
+    DO UPDATE SET setting_value = $1
+    `,
+    [String(minRate)]
+  );
+
+  await pool.query(
+    `
+    INSERT INTO bank_settings (setting_key, setting_value)
+    VALUES ('loan_max_rate', $1)
+    ON CONFLICT (setting_key)
+    DO UPDATE SET setting_value = $1
+    `,
+    [String(maxRate)]
+  );
+}
+
+function getLoanCreditLimit(totalSeconds) {
+  return Math.floor((Number(totalSeconds) || 0) / 3600) * 1000;
+}
+
+function calculateLoanRate(amount, creditLimit, settings) {
+  const minRate = settings.minRate;
+  const maxRate = settings.maxRate;
+  const range = maxRate - minRate;
+
+  if (!creditLimit || creditLimit <= 0) return maxRate;
+
+  const ratio = amount / creditLimit;
+
+  if (ratio <= 0.25) return maxRate;
+  if (ratio <= 0.5) return Number((minRate + range * 0.6).toFixed(4));
+  if (ratio <= 0.75) return Number((minRate + range * 0.3).toFixed(4));
+  return minRate;
+}
+
+async function getActiveLoan(userId) {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM bank_loans
+    WHERE user_id = $1 AND status = 'active'
+    ORDER BY loan_id DESC
+    LIMIT 1
+    `,
+    [userId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function getBankOwnerUser() {
+  return client.users.fetch(BANK_OWNER_ID).catch(() => null);
+}
+
+async function getBankEmbed(user) {
+  const data = await getUserTotalData(user.id);
+  const activeLoan = await getActiveLoan(user.id);
+  const bankOwner = await getBankOwnerUser();
+
+  const creditLimit = getLoanCreditLimit(Number(data.total_seconds));
+  const hasLoan = Boolean(activeLoan);
+
+  const embed = new EmbedBuilder()
+    .setTitle("Hizu Jin 信託商業銀行")
+    .setDescription(
+      [
+        `董事長：<@${BANK_OWNER_ID}>`,
+        "────────────",
+        "有任何資金需求，歡迎來電，圓你的發財夢，就是我的日行一善。",
+        "",
+        `你的可貸款額度為：${
+          hasLoan ? "無法借款" : `🪙 ${formatCoins(creditLimit)}`
+        }`,
+        `是否有進行中的貸款：${hasLoan ? "是" : "否"}`,
+        hasLoan
+          ? `貸款剩餘清償期數：${activeLoan.paid_installments}/${activeLoan.installment_count}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+    )
+    .setColor(0xf1c40f)
+    .setTimestamp();
+
+  if (bankOwner) {
+    embed.setThumbnail(bankOwner.displayAvatarURL({ size: 256 }));
+  }
+
+  return embed;
+}
+
+function getRejectedLoanEmbed(user, reason) {
+  return new EmbedBuilder()
+    .setTitle("經複查，本行將退回您的貸款申請")
+    .setDescription(`***拒絕原因：${reason}***`)
+    .setColor(0xe74c3c)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .setTimestamp();
+}
+
+function getLoanPreviewEmbed(user, application) {
+  return new EmbedBuilder()
+    .setTitle("恭喜您，經核查，本行已通過您的貸款申請")
+    .setDescription(
+      [
+        "***請確認本行貸款單，確認後請按送出***",
+        "",
+        "────────────",
+        "",
+        `實際貸款金額：🪙 ${formatCoins(application.principal)}`,
+        `還款期數：${application.installments} 期`,
+        `利率：${application.rate}%`,
+        `每月還款日期：每月 ${application.paymentDay} 日`,
+        `實際總還款金額：🪙 ${formatCoins(application.totalRepayment)}`,
+      ].join("\n")
+    )
+    .setColor(0x2ecc71)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .setTimestamp();
+}
+
+function getNoActiveLoanEmbed(user) {
+  return new EmbedBuilder()
+    .setTitle("貸款案件查詢")
+    .setDescription("目前沒有進行中的貸款案件。")
+    .setColor(0x95a5a6)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .setTimestamp();
+}
+
+function getLoanCaseEmbed(user, loan) {
+  if (!loan) return getNoActiveLoanEmbed(user);
+
+  const remainingInstallments =
+    Number(loan.installment_count) - Number(loan.paid_installments);
+  const remainingAmount =
+    Number(loan.total_repayment) - Number(loan.paid_amount || 0);
+
+  return new EmbedBuilder()
+    .setTitle("貸款案件查詢")
+    .setDescription(
+      [
+        "是否有進行中的貸款：是",
+        `貸款本金：🪙 ${formatCoins(loan.principal)}`,
+        `利率：${Number(loan.interest_rate)}%`,
+        `總還款金額：🪙 ${formatCoins(loan.total_repayment)}`,
+        `每期還款金額：🪙 ${formatCoins(loan.monthly_payment)}`,
+        `已繳期數：${loan.paid_installments} / ${loan.installment_count}`,
+        `剩餘期數：${remainingInstallments}`,
+        `剩餘應還金額：🪙 ${formatCoins(remainingAmount)}`,
+        `每月還款日期：每月 ${loan.next_payment_day} 日`,
+      ].join("\n")
+    )
+    .setColor(0x3498db)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .setTimestamp();
+}
+
+function getRepaySelectEmbed(user, loan) {
+  const remainingInstallments =
+    Number(loan.installment_count) - Number(loan.paid_installments);
+  const remainingAmount =
+    Number(loan.total_repayment) - Number(loan.paid_amount || 0);
+
+  return new EmbedBuilder()
+    .setTitle("貸款還款")
+    .setDescription(
+      [
+        "請選擇本次想要償還的期數。",
+        "",
+        `剩餘期數：${remainingInstallments}`,
+        `剩餘應還金額：🪙 ${formatCoins(remainingAmount)}`,
+      ].join("\n")
+    )
+    .setColor(0x3498db)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .setTimestamp();
+}
+
+function calculateRepaymentPreview(loan, installmentsToPay) {
+  const remainingInstallments =
+    Number(loan.installment_count) - Number(loan.paid_installments);
+  const safeInstallments = Math.min(installmentsToPay, remainingInstallments);
+
+  const remainingAmount =
+    Number(loan.total_repayment) - Number(loan.paid_amount || 0);
+
+  const paymentAmount = Math.min(
+    Number(loan.monthly_payment) * safeInstallments,
+    remainingAmount
+  );
+
+  const totalInterest = Number(loan.total_interest) || 0;
+  const paidInterest = Number(loan.paid_interest) || 0;
+  const remainingInterest = Math.max(0, totalInterest - paidInterest);
+  const interestPerInstallment = Math.ceil(totalInterest / Number(loan.installment_count));
+  const interestPaid = Math.min(
+    interestPerInstallment * safeInstallments,
+    remainingInterest
+  );
+
+  return {
+    installments: safeInstallments,
+    paymentAmount,
+    interestPaid,
+  };
+}
+
+async function getRepayConfirmEmbed(user, loan, installmentsToPay) {
+  const data = await getUserTotalData(user.id);
+  const preview = calculateRepaymentPreview(loan, installmentsToPay);
+
+  return new EmbedBuilder()
+    .setTitle("即將還款確認")
+    .setDescription(
+      [
+        `本次還款期數：${preview.installments} 期`,
+        `每期還款金額：🪙 ${formatCoins(loan.monthly_payment)}`,
+        `即將消耗金額：🪙 ${formatCoins(preview.paymentAmount)}`,
+        `目前剩餘金幣：🪙 ${formatCoins(data.coins)}`,
+      ].join("\n")
+    )
+    .setColor(0xe67e22)
+    .setThumbnail(user.displayAvatarURL({ size: 256 }))
+    .setTimestamp();
+}
+
+async function createLoan(userId, username, application) {
+  const now = Date.now();
+
+  const result = await pool.query(
+    `
+    INSERT INTO bank_loans (
+      user_id,
+      username,
+      principal,
+      interest_rate,
+      total_interest,
+      paid_interest,
+      total_repayment,
+      installment_count,
+      paid_installments,
+      paid_amount,
+      monthly_payment,
+      next_payment_day,
+      status,
+      created_at,
+      updated_at
+    )
+    VALUES ($1, $2, $3, $4, $5, 0, $6, $7, 0, 0, $8, $9, 'active', $10, $10)
+    RETURNING *
+    `,
+    [
+      userId,
+      username,
+      application.principal,
+      application.rate,
+      application.totalInterest,
+      application.totalRepayment,
+      application.installments,
+      application.monthlyPayment,
+      application.paymentDay,
+      now,
+    ]
+  );
+
+  await addCoins(userId, username, application.principal);
+
+  return result.rows[0];
+}
+
+async function repayLoan(user, loan, installmentsToPay) {
+  const preview = calculateRepaymentPreview(loan, installmentsToPay);
+  const db = await pool.connect();
+
+  try {
+    await db.query("BEGIN");
+
+    const deductResult = await db.query(
+      `
+      UPDATE work_totals
+      SET coins = coins - $1
+      WHERE user_id = $2 AND coins >= $1
+      RETURNING coins
+      `,
+      [preview.paymentAmount, user.id]
+    );
+
+    if (deductResult.rows.length === 0) {
+      await db.query("ROLLBACK");
+      return {
+        ok: false,
+        text: "金幣不足，無法完成還款。",
+      };
+    }
+
+    await db.query(
+      `
+      INSERT INTO work_totals (user_id, username, total_seconds, mood_score, coins)
+      VALUES ($1, $2, 0, 0, $3)
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        coins = work_totals.coins + $3,
+        username = $2
+      `,
+      [BANK_OWNER_ID, BANK_OWNER_NAME, preview.interestPaid]
+    );
+
+    const newPaidInstallments =
+      Number(loan.paid_installments) + preview.installments;
+    const newPaidAmount = Number(loan.paid_amount || 0) + preview.paymentAmount;
+    const newPaidInterest =
+      Number(loan.paid_interest || 0) + preview.interestPaid;
+
+    const isPaid =
+      newPaidInstallments >= Number(loan.installment_count) ||
+      newPaidAmount >= Number(loan.total_repayment);
+
+    await db.query(
+      `
+      UPDATE bank_loans
+      SET
+        paid_installments = $1,
+        paid_amount = $2,
+        paid_interest = $3,
+        status = $4,
+        updated_at = $5
+      WHERE loan_id = $6
+      `,
+      [
+        Math.min(newPaidInstallments, Number(loan.installment_count)),
+        Math.min(newPaidAmount, Number(loan.total_repayment)),
+        Math.min(newPaidInterest, Number(loan.total_interest)),
+        isPaid ? "paid" : "active",
+        Date.now(),
+        loan.loan_id,
+      ]
+    );
+
+    await db.query(
+      `
+      INSERT INTO bank_loan_payments (
+        loan_id,
+        user_id,
+        paid_installments,
+        paid_amount,
+        interest_paid,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6)
+      `,
+      [
+        loan.loan_id,
+        user.id,
+        preview.installments,
+        preview.paymentAmount,
+        preview.interestPaid,
+        Date.now(),
+      ]
+    );
+
+    await db.query("COMMIT");
+
+    return {
+      ok: true,
+      text: isPaid
+        ? "還款成功，您的貸款已全數清償。"
+        : `還款成功，已償還 ${preview.installments} 期。`,
+    };
+  } catch (error) {
+    await db.query("ROLLBACK");
+    console.error("還款失敗：", error);
+
+    return {
+      ok: false,
+      text: "還款時發生錯誤，請稍後再試。",
+    };
+  } finally {
+    db.release();
+  }
+}
+
+async function handleLoanApplicationSubmit(interaction) {
+  const user = interaction.user;
+  const amount = parsePositiveInteger(
+    interaction.fields.getTextInputValue("loan_amount")
+  );
+  const installments = parsePositiveInteger(
+    interaction.fields.getTextInputValue("loan_installments")
+  );
+
+  const data = await getUserTotalData(user.id);
+  const activeLoan = await getActiveLoan(user.id);
+  const creditLimit = getLoanCreditLimit(Number(data.total_seconds));
+
+  if (!amount) {
+    const embed = getRejectedLoanEmbed(user, "貸款金額必須為有效正整數。");
+    await interaction.reply({
+      embeds: [embed],
+      components: [getBankBackButtons()],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (!installments) {
+    const embed = getRejectedLoanEmbed(user, "分期期數必須為有效正整數。");
+    await interaction.reply({
+      embeds: [embed],
+      components: [getBankBackButtons()],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (activeLoan) {
+    const embed = getRejectedLoanEmbed(user, "您目前已有進行中的貸款案件。");
+    await interaction.reply({
+      embeds: [embed],
+      components: [getBankBackButtons()],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (amount > creditLimit) {
+    const embed = getRejectedLoanEmbed(user, "申請金額超過您的可貸款額度。");
+    await interaction.reply({
+      embeds: [embed],
+      components: [getBankBackButtons()],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (installments > MAX_LOAN_INSTALLMENTS) {
+    const embed = getRejectedLoanEmbed(user, "分期期數不可超過72期。");
+    await interaction.reply({
+      embeds: [embed],
+      components: [getBankBackButtons()],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const settings = await getBankSettings();
+  const rate = calculateLoanRate(amount, creditLimit, settings);
+  const totalInterest = Math.ceil(amount * (rate / 100));
+  const totalRepayment = amount + totalInterest;
+  const monthlyPayment = Math.ceil(totalRepayment / installments);
+  const paymentDay = getTaipeiDate().getUTCDate();
+
+  const application = {
+    principal: amount,
+    installments,
+    rate,
+    totalInterest,
+    totalRepayment,
+    monthlyPayment,
+    paymentDay,
+  };
+
+  pendingLoanApplications.set(user.id, application);
+
+  const embed = getLoanPreviewEmbed(user, application);
+
+  await interaction.reply({
+    embeds: [embed],
+    components: [getLoanConfirmButtons()],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleBankAdminCommand(interaction) {
+  if (!isAdmin(interaction.member)) {
+    await interaction.reply({
+      content: "你沒有權限使用這個指令。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const sub = interaction.options.getSubcommand();
+
+  if (sub === "set-rate") {
+    const minRate = interaction.options.getNumber("min-rate");
+    const maxRate = interaction.options.getNumber("max-rate");
+
+    if (
+      !Number.isFinite(minRate) ||
+      !Number.isFinite(maxRate) ||
+      minRate <= 0 ||
+      maxRate <= 0 ||
+      maxRate < minRate
+    ) {
+      await interaction.reply({
+        content: "利率設定錯誤，最低利率與最高利率都必須大於 0，且最高利率不可低於最低利率。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    await setBankRates(minRate, maxRate);
+
+    await interaction.reply({
+      content: `已更新銀行利率範圍：${minRate}% ~ ${maxRate}%`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (sub === "info") {
+    const user = interaction.options.getUser("user");
+    const loan = await getActiveLoan(user.id);
+    const embed = getLoanCaseEmbed(user, loan);
+
+    await interaction.reply({
+      embeds: [embed],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (sub === "clear-loan") {
+    const user = interaction.options.getUser("user");
+
+    await pool.query(
+      `
+      UPDATE bank_loans
+      SET status = 'cancelled', updated_at = $1
+      WHERE user_id = $2 AND status = 'active'
+      `,
+      [Date.now(), user.id]
+    );
+
+    await interaction.reply({
+      content: `已取消 ${user.username} 的進行中貸款案件。`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (sub === "set-paid") {
+    const user = interaction.options.getUser("user");
+    const paidInstallments = interaction.options.getInteger("paid-installments");
+    const loan = await getActiveLoan(user.id);
+
+    if (!loan) {
+      await interaction.reply({
+        content: "該用戶目前沒有進行中的貸款案件。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const safePaid = Math.max(
+      0,
+      Math.min(paidInstallments, Number(loan.installment_count))
+    );
+    const paidAmount = Math.min(
+      Number(loan.monthly_payment) * safePaid,
+      Number(loan.total_repayment)
+    );
+    const paidInterest = Math.min(
+      Math.ceil(Number(loan.total_interest) / Number(loan.installment_count)) *
+        safePaid,
+      Number(loan.total_interest)
+    );
+
+    await pool.query(
+      `
+      UPDATE bank_loans
+      SET
+        paid_installments = $1,
+        paid_amount = $2,
+        paid_interest = $3,
+        status = $4,
+        updated_at = $5
+      WHERE loan_id = $6
+      `,
+      [
+        safePaid,
+        paidAmount,
+        paidInterest,
+        safePaid >= Number(loan.installment_count) ? "paid" : "active",
+        Date.now(),
+        loan.loan_id,
+      ]
+    );
+
+    await interaction.reply({
+      content: `已將 ${user.username} 的已繳期數設定為 ${safePaid}/${loan.installment_count}。`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (sub === "add-loan") {
+    const user = interaction.options.getUser("user");
+    const amount = interaction.options.getInteger("amount");
+    const installments = interaction.options.getInteger("installments");
+
+    if (amount <= 0 || installments <= 0 || installments > MAX_LOAN_INSTALLMENTS) {
+      await interaction.reply({
+        content: "貸款金額與期數設定錯誤，期數最多 72 期。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const activeLoan = await getActiveLoan(user.id);
+
+    if (activeLoan) {
+      await interaction.reply({
+        content: "該用戶目前已有進行中的貸款案件。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const data = await getUserTotalData(user.id);
+    const creditLimit = Math.max(getLoanCreditLimit(Number(data.total_seconds)), amount);
+    const settings = await getBankSettings();
+    const rate = calculateLoanRate(amount, creditLimit, settings);
+    const totalInterest = Math.ceil(amount * (rate / 100));
+    const totalRepayment = amount + totalInterest;
+    const monthlyPayment = Math.ceil(totalRepayment / installments);
+    const paymentDay = getTaipeiDate().getUTCDate();
+
+    await createLoan(user.id, user.username, {
+      principal: amount,
+      installments,
+      rate,
+      totalInterest,
+      totalRepayment,
+      monthlyPayment,
+      paymentDay,
+    });
+
+    await interaction.reply({
+      content: `已為 ${user.username} 建立測試貸款：本金 ${formatCoins(amount)}，期數 ${installments}，利率 ${rate}%。`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+}
+
+async function registerSlashCommands() {
+  const clientId = process.env.CLIENT_ID;
+  const guildId = process.env.GUILD_ID;
+  const token = process.env.TOKEN;
+
+  if (!clientId || !guildId || !token) {
+    console.log("未設定 CLIENT_ID / GUILD_ID / TOKEN，略過 Slash Command 註冊。");
+    return;
+  }
+
+  const commands = [
+    new SlashCommandBuilder()
+      .setName("wt")
+      .setDescription("WorkTime Bot 指令")
+      .addSubcommand((sub) =>
+        sub.setName("bank").setDescription("開啟 Hizu Jin 信託商業銀行")
+      )
+      .addSubcommandGroup((group) =>
+        group
+          .setName("bank-admin")
+          .setDescription("銀行 Debug 管理指令")
+          .addSubcommand((sub) =>
+            sub
+              .setName("set-rate")
+              .setDescription("設定銀行利率範圍")
+              .addNumberOption((option) =>
+                option
+                  .setName("min-rate")
+                  .setDescription("最低利率，例如 0.5")
+                  .setRequired(true)
+              )
+              .addNumberOption((option) =>
+                option
+                  .setName("max-rate")
+                  .setDescription("最高利率，例如 1")
+                  .setRequired(true)
+              )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("info")
+              .setDescription("查詢指定用戶貸款狀態")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("clear-loan")
+              .setDescription("取消指定用戶進行中的貸款")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("set-paid")
+              .setDescription("設定指定用戶貸款已繳期數")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+              .addIntegerOption((option) =>
+                option
+                  .setName("paid-installments")
+                  .setDescription("已繳期數")
+                  .setRequired(true)
+              )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("add-loan")
+              .setDescription("替指定用戶建立測試貸款")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+              .addIntegerOption((option) =>
+                option
+                  .setName("amount")
+                  .setDescription("貸款金額")
+                  .setRequired(true)
+              )
+              .addIntegerOption((option) =>
+                option
+                  .setName("installments")
+                  .setDescription("分期期數，最多72期")
+                  .setRequired(true)
+              )
+          )
+      ),
+  ].map((command) => command.toJSON());
+
+  const rest = new REST({ version: "10" }).setToken(token);
+
+  await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
+    body: commands,
+  });
+
+  console.log("Slash Command 註冊完成。");
 }
 
 async function getSelfStatusEmbed(user) {
@@ -951,7 +1920,6 @@ const row1 = new ActionRowBuilder().addComponents(
     .setEmoji("📋")
     .setStyle(ButtonStyle.Primary),
 
-  // 👇 改到這裡（我的狀態上來）
   new ButtonBuilder()
     .setCustomId("wt_status")
     .setLabel("我的狀態")
@@ -960,7 +1928,6 @@ const row1 = new ActionRowBuilder().addComponents(
 );
 
 const row2 = new ActionRowBuilder().addComponents(
-  // 👇 排行榜下去
   new ButtonBuilder()
     .setCustomId("wt_rank")
     .setLabel("排行榜")
@@ -1172,9 +2139,63 @@ client.once(Events.ClientReady, async () => {
       );
     `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bank_loans (
+        loan_id SERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        username TEXT,
+        principal BIGINT NOT NULL,
+        interest_rate NUMERIC(8, 4) NOT NULL,
+        total_interest BIGINT NOT NULL,
+        paid_interest BIGINT DEFAULT 0,
+        total_repayment BIGINT NOT NULL,
+        installment_count INT NOT NULL,
+        paid_installments INT DEFAULT 0,
+        paid_amount BIGINT DEFAULT 0,
+        monthly_payment BIGINT NOT NULL,
+        next_payment_day INT NOT NULL,
+        status TEXT DEFAULT 'active',
+        created_at BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bank_loan_payments (
+        payment_id SERIAL PRIMARY KEY,
+        loan_id INT NOT NULL,
+        user_id TEXT NOT NULL,
+        paid_installments INT NOT NULL,
+        paid_amount BIGINT NOT NULL,
+        interest_paid BIGINT NOT NULL,
+        created_at BIGINT NOT NULL
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS bank_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT NOT NULL
+      );
+    `);
+
+    await pool.query(`
+      INSERT INTO bank_settings (setting_key, setting_value)
+      VALUES ('loan_min_rate', '0.5')
+      ON CONFLICT (setting_key) DO NOTHING
+    `);
+
+    await pool.query(`
+      INSERT INTO bank_settings (setting_key, setting_value)
+      VALUES ('loan_max_rate', '1')
+      ON CONFLICT (setting_key) DO NOTHING
+    `);
+
     await loadActiveSessions();
 
     console.log("資料表確認完成");
+
+    await registerSlashCommands();
 
     await checkAndDistributeRankingRewards();
     startRankingRewardTimer();
@@ -1186,9 +2207,84 @@ client.once(Events.ClientReady, async () => {
   }
 });
 
-// ===== 按鈕互動 =====
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName !== "wt") return;
+
+      if (interaction.inGuild() && !isAllowedChannel(interaction.channelId)) {
+        await interaction.reply({
+          content: "這個頻道不能使用此指令。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const group = interaction.options.getSubcommandGroup(false);
+      const sub = interaction.options.getSubcommand();
+
+      if (group === "bank-admin") {
+        await handleBankAdminCommand(interaction);
+        return;
+      }
+
+      if (sub === "bank") {
+        const embed = await getBankEmbed(interaction.user);
+
+        await interaction.reply({
+          embeds: [embed],
+          components: [getBankMainButtons()],
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.isModalSubmit()) {
+      if (interaction.customId === "wt_bank_borrow_modal") {
+        await handleLoanApplicationSubmit(interaction);
+        return;
+      }
+
+      return;
+    }
+
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId === "wt_bank_repay_select") {
+        const installments = Number(interaction.values[0]);
+        const loan = await getActiveLoan(interaction.user.id);
+
+        if (!loan) {
+          await interaction.update({
+            embeds: [getNoActiveLoanEmbed(interaction.user)],
+            components: [getBackToBankButton()],
+          });
+          return;
+        }
+
+        pendingRepayments.set(interaction.user.id, {
+          loanId: loan.loan_id,
+          installments,
+        });
+
+        const embed = await getRepayConfirmEmbed(
+          interaction.user,
+          loan,
+          installments
+        );
+
+        await interaction.update({
+          embeds: [embed],
+          components: [getRepayConfirmButtons()],
+        });
+        return;
+      }
+
+      return;
+    }
+
     if (!interaction.isButton()) return;
 
     if (interaction.customId.startsWith("mood:")) {
@@ -1210,6 +2306,190 @@ client.on(Events.InteractionCreate, async (interaction) => {
         components: [],
       });
       return;
+    }
+
+    if (interaction.customId.startsWith("wt_bank")) {
+      const user = interaction.user;
+
+      if (interaction.customId === "wt_bank_back") {
+        const embed = await getBankEmbed(user);
+
+        await interaction.update({
+          embeds: [embed],
+          components: [getBankMainButtons()],
+        });
+        return;
+      }
+
+      if (interaction.customId === "wt_bank_borrow") {
+        await interaction.showModal(createLoanModal());
+        return;
+      }
+
+      if (interaction.customId === "wt_bank_repay") {
+        const loan = await getActiveLoan(user.id);
+
+        if (!loan) {
+          await interaction.update({
+            embeds: [getNoActiveLoanEmbed(user)],
+            components: [getBackToBankButton()],
+          });
+          return;
+        }
+
+        const remainingInstallments =
+          Number(loan.installment_count) - Number(loan.paid_installments);
+
+        if (remainingInstallments <= 0) {
+          await interaction.update({
+            embeds: [getNoActiveLoanEmbed(user)],
+            components: [getBackToBankButton()],
+          });
+          return;
+        }
+
+        await interaction.update({
+          embeds: [getRepaySelectEmbed(user, loan)],
+          components: [createRepaySelect(remainingInstallments), getBackToBankButton()],
+        });
+        return;
+      }
+
+      if (interaction.customId === "wt_bank_query") {
+        const loan = await getActiveLoan(user.id);
+        const embed = getLoanCaseEmbed(user, loan);
+
+        await interaction.update({
+          embeds: [embed],
+          components: loan ? [getLoanCaseButtons()] : [getBackToBankButton()],
+        });
+        return;
+      }
+
+      if (interaction.customId === "wt_bank_accept_loan") {
+        const application = pendingLoanApplications.get(user.id);
+
+        if (!application) {
+          await interaction.update({
+            embeds: [
+              getRejectedLoanEmbed(user, "找不到您的貸款申請資料，請重新申請。"),
+            ],
+            components: [getBankBackButtons()],
+          });
+          return;
+        }
+
+        const activeLoan = await getActiveLoan(user.id);
+
+        if (activeLoan) {
+          pendingLoanApplications.delete(user.id);
+
+          await interaction.update({
+            embeds: [
+              getRejectedLoanEmbed(user, "您目前已有進行中的貸款案件。"),
+            ],
+            components: [getBankBackButtons()],
+          });
+          return;
+        }
+
+        await createLoan(user.id, user.username, application);
+        pendingLoanApplications.delete(user.id);
+
+        const embed = new EmbedBuilder()
+          .setTitle("貸款撥款成功")
+          .setDescription(
+            `本行已撥款 🪙 ${formatCoins(application.principal)} 至您的錢包。`
+          )
+          .setColor(0x2ecc71)
+          .setThumbnail(user.displayAvatarURL({ size: 256 }))
+          .setTimestamp();
+
+        await interaction.update({
+          embeds: [embed],
+          components: [getBackToBankButton()],
+        });
+        return;
+      }
+
+      if (interaction.customId === "wt_bank_reject_loan") {
+        pendingLoanApplications.delete(user.id);
+
+        const embed = new EmbedBuilder()
+          .setTitle("您已取消本次貸款申請")
+          .setColor(0x95a5a6)
+          .setThumbnail(user.displayAvatarURL({ size: 256 }))
+          .setTimestamp();
+
+        await interaction.update({
+          embeds: [embed],
+          components: [getBackToBankButton()],
+        });
+        return;
+      }
+
+      if (interaction.customId === "wt_bank_cancel_repay") {
+        pendingRepayments.delete(user.id);
+
+        const embed = new EmbedBuilder()
+          .setTitle("您已取消本次還款")
+          .setColor(0x95a5a6)
+          .setThumbnail(user.displayAvatarURL({ size: 256 }))
+          .setTimestamp();
+
+        await interaction.update({
+          embeds: [embed],
+          components: [getBackToBankButton()],
+        });
+        return;
+      }
+
+      if (interaction.customId === "wt_bank_confirm_repay") {
+        const repayment = pendingRepayments.get(user.id);
+
+        if (!repayment) {
+          await interaction.update({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle("找不到還款資料")
+                .setDescription("請重新操作還款流程。")
+                .setColor(0xe74c3c)
+                .setThumbnail(user.displayAvatarURL({ size: 256 }))
+                .setTimestamp(),
+            ],
+            components: [getBackToBankButton()],
+          });
+          return;
+        }
+
+        const loan = await getActiveLoan(user.id);
+
+        if (!loan || Number(loan.loan_id) !== Number(repayment.loanId)) {
+          pendingRepayments.delete(user.id);
+
+          await interaction.update({
+            embeds: [getNoActiveLoanEmbed(user)],
+            components: [getBackToBankButton()],
+          });
+          return;
+        }
+
+        const result = await repayLoan(user, loan, repayment.installments);
+        pendingRepayments.delete(user.id);
+
+        const embed = new EmbedBuilder()
+          .setTitle(result.ok ? "還款成功" : "還款失敗")
+          .setDescription(result.text)
+          .setColor(result.ok ? 0x2ecc71 : 0xe74c3c)
+          .setThumbnail(user.displayAvatarURL({ size: 256 }))
+          .setTimestamp();
+
+        await interaction.update({
+          embeds: [embed],
+          components: [getBackToBankButton()],
+        });
+        return;
+      }
     }
 
     if (!isAllowedChannel(interaction.channelId)) return;
@@ -1309,17 +2589,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.customId === "wt_help") {
       await interaction.reply({
         content:
-          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!我的狀態`\n`!wt add worktime @人 秒數` [僅提供開發Debug使用]\n`!wt remove worktime @人` [僅提供開發Debug使用]\n`!wt add workmood @人 指數` [僅提供開發Debug使用]\n`!wt remove workmood @人` [僅提供開發Debug使用]\n`!wt add coin @人 數量` [僅提供開發Debug使用]\n`!wt remove coin @人` [僅提供開發Debug使用]\n`!強制上班 @人` [僅提供開發Debug使用]\n`!強制下班 @人` [僅提供開發Debug使用]",
+          "📖 指令：\n`!面板`\n`!查詢`\n`!排行榜`\n`!我的狀態`\n`!wt add worktime @人 秒數` [僅提供開發Debug使用]\n`!wt remove worktime @人` [僅提供開發Debug使用]\n`!wt add workmood @人 指數` [僅提供開發Debug使用]\n`!wt remove workmood @人` [僅提供開發Debug使用]\n`!wt add coin @人 數量` [僅提供開發Debug使用]\n`!wt remove coin @人` [僅提供開發Debug使用]\n`!強制上班 @人` [僅提供開發Debug使用]\n`!強制下班 @人` [僅提供開發Debug使用]\n`!wt refresh panel` [僅提供開發Debug使用]\n`/wt bank`\n`/wt bank-admin ...` [僅提供開發Debug使用]",
         flags: MessageFlags.Ephemeral,
       });
       return;
     }
   } catch (error) {
-    console.error("處理按鈕時發生錯誤：", error);
+    console.error("處理互動時發生錯誤：", error);
   }
 });
 
-// ===== 文字指令 =====
 client.on("messageCreate", async (msg) => {
   try {
     if (msg.author.bot) return;

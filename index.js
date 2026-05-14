@@ -468,12 +468,15 @@ function createRepaySelect(remainingInstallments) {
       .setDescription(`本次償還 ${n} 期貸款`)
   );
 
-  options.push(
-    new StringSelectMenuOptionBuilder()
-      .setLabel("一次還清")
-      .setValue(String(remainingInstallments))
-      .setDescription(`一次償還剩餘 ${remainingInstallments} 期`)
-  );
+  // 避免「一次還清」和前面的還款期數 value 重複
+  if (!baseOptions.includes(remainingInstallments)) {
+    options.push(
+      new StringSelectMenuOptionBuilder()
+        .setLabel("一次還清")
+        .setValue(String(remainingInstallments))
+        .setDescription(`一次償還剩餘 ${remainingInstallments} 期`)
+    );
+  }
 
   const select = new StringSelectMenuBuilder()
     .setCustomId("wt_bank_repay_select")

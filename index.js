@@ -1896,12 +1896,8 @@ function getPanel() {
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
         [
-          `💼 **命苦上班打工人系統已上線於 ${
-            process.env.PANEL_CHANNEL_ID
-              ? `<#${process.env.PANEL_CHANNEL_ID}>`
-              : "目前頻道"
-          }**`,
-          "<:SPACE:1506460111856468070> **你可以使用 Buttons 完成打卡、或查詢狀態**",
+          "## 💼 命苦上班打工人系統已成功部屬。",
+          "### <:SPACE:1506460111856468070> 第 1 頁：上下班功能頁",
         ].join("\n")
       )
     )
@@ -1944,12 +1940,8 @@ function getPanelMore() {
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
         [
-          `💼 **命苦上班打工人系統已上線於 ${
-            process.env.PANEL_CHANNEL_ID
-              ? `<#${process.env.PANEL_CHANNEL_ID}>`
-              : "目前頻道"
-          }。**`,
-          "<:SPACE:1506460111856468070> **請選擇你要使用的其他功能**",
+          "## 💼 命苦上班打工人系統已成功部屬。",
+          "### <:SPACE:1506460111856468070> 第 2 頁：更多功能頁",
         ].join("\n")
       )
     )

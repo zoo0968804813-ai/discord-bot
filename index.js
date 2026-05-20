@@ -2109,7 +2109,7 @@ async function endWork(userId, username) {
 
     return {
       ok: false,
-      text: "你的上班紀錄已經超過 24 小時了，這次不計算喔～",
+      text: "你的上班紀錄已經超過 24 小時了，這次不計算ㄛ～",
     };
   }
 

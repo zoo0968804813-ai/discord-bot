@@ -1900,7 +1900,7 @@ function getPanel() {
             process.env.PANEL_CHANNEL_ID
               ? `<#${process.env.PANEL_CHANNEL_ID}>`
               : "目前頻道"
-          }。**`,
+          }**`,
           "<:SPACE:1506460111856468070> **你可以使用 Buttons 完成打卡、或查詢狀態**",
         ].join("\n")
       )

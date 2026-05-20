@@ -1911,26 +1911,26 @@ function getPanel() {
         .setSpacing(SeparatorSpacingSize.Small)
     )
     .addActionRowComponents(
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("wt_start")
-          .setLabel("上班")
-          .setEmoji("🟢")
-          .setStyle(ButtonStyle.Secondary),
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_start")
+      .setLabel("開始上班")
+      .setEmoji("🟢")
+      .setStyle(ButtonStyle.Secondary),
 
-        new ButtonBuilder()
-          .setCustomId("wt_end")
-          .setLabel("下班")
-          .setEmoji("🔴")
-          .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("wt_end")
+      .setLabel("完成下班")
+      .setEmoji("🔴")
+      .setStyle(ButtonStyle.Secondary),
 
-        new ButtonBuilder()
-          .setCustomId("wt_more")
-          .setLabel("其他功能")
-          .setEmoji("📂")
-          .setStyle(ButtonStyle.Secondary)
-      )
-    );
+    new ButtonBuilder()
+      .setCustomId("wt_more")
+      .setLabel("其他功能")
+      .setEmoji("📂")
+      .setStyle(ButtonStyle.Secondary)
+  )
+);
 
   return {
     components: [container],
@@ -1959,41 +1959,32 @@ function getPanelMore() {
         .setSpacing(SeparatorSpacingSize.Small)
     )
     .addActionRowComponents(
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("wt_query")
-          .setLabel("查詢")
-          .setEmoji("📋")
-          .setStyle(ButtonStyle.Secondary),
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("wt_query")
+      .setLabel("上班查詢")
+      .setEmoji("📋")
+      .setStyle(ButtonStyle.Secondary),
 
-        new ButtonBuilder()
-          .setCustomId("wt_status")
-          .setLabel("我的狀態")
-          .setEmoji("👤")
-          .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("wt_status")
+      .setLabel("我的狀態")
+      .setEmoji("👤")
+      .setStyle(ButtonStyle.Secondary),
 
-        new ButtonBuilder()
-          .setCustomId("wt_rank")
-          .setLabel("排行榜")
-          .setEmoji("🏆")
-          .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId("wt_rank")
+      .setLabel("工時排行")
+      .setEmoji("🏆")
+      .setStyle(ButtonStyle.Secondary),
 
-        new ButtonBuilder()
-          .setCustomId("wt_help")
-          .setLabel("幫助")
-          .setEmoji("❔")
-          .setStyle(ButtonStyle.Secondary)
-      )
-    )
-    .addActionRowComponents(
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("wt_panel_main")
-          .setLabel("返回主面板")
-          .setEmoji("↩️")
-          .setStyle(ButtonStyle.Secondary)
-      )
-    );
+    new ButtonBuilder()
+      .setCustomId("wt_panel_main")
+      .setLabel("返回面板")
+      .setEmoji("↩️")
+      .setStyle(ButtonStyle.Secondary)
+  )
+);
 
   return {
     components: [container],

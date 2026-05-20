@@ -1896,7 +1896,7 @@ function getPanel() {
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
         [
-          "## 💼 命苦上班打工人系統已成功部屬。",
+          "### 💼 命苦上班打工人系統已成功部屬",
           "### <:SPACE:1506460111856468070> 第 1 頁：上下班功能頁",
         ].join("\n")
       )
@@ -1940,7 +1940,7 @@ function getPanelMore() {
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
         [
-          "## 💼 命苦上班打工人系統已成功部屬。",
+          "### 💼 命苦上班打工人系統已成功部屬",
           "### <:SPACE:1506460111856468070> 第 2 頁：更多功能頁",
         ].join("\n")
       )

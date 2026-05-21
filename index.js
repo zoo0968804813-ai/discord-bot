@@ -35,13 +35,18 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
   ],
 });
 
 const workStartTimes = new Map();
+const voiceStartTimes = new Map();
+
 const clearConfirmations = new Map();
 const moodResetConfirmations = new Map();
 const coinClearConfirmations = new Map();
+
+const VOICE_COIN_RATE_PER_HOUR = 100;
 
 const pendingLoanApplications = new Map();
 const pendingRepayments = new Map();
@@ -544,6 +549,143 @@ async function loadActiveSessions() {
   }
 
   console.log(`已恢復 ${result.rows.length} 位上班中的打工人`);
+}
+
+async function saveActiveVoiceSession(userId, username, channelId, startTime) {
+  await pool.query(
+    `
+    INSERT INTO active_voice_sessions (user_id, username, channel_id, start_time)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      username = $2,
+      channel_id = $3,
+      start_time = $4
+    `,
+    [userId, username, channelId, startTime]
+  );
+}
+
+async function updateActiveVoiceChannel(userId, channelId) {
+  await pool.query(
+    `
+    UPDATE active_voice_sessions
+    SET channel_id = $1
+    WHERE user_id = $2
+    `,
+    [channelId, userId]
+  );
+}
+
+async function removeActiveVoiceSession(userId) {
+  await pool.query(
+    `
+    DELETE FROM active_voice_sessions
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
+}
+
+async function loadActiveVoiceSessions() {
+  const result = await pool.query(`
+    SELECT user_id, username, channel_id, start_time
+    FROM active_voice_sessions
+  `);
+
+  voiceStartTimes.clear();
+
+  for (const row of result.rows) {
+    voiceStartTimes.set(row.user_id, {
+      username: row.username,
+      channelId: row.channel_id,
+      startTime: Number(row.start_time),
+    });
+  }
+
+  console.log(`已恢復 ${result.rows.length} 位語音在線中的打工人`);
+}
+
+async function addVoiceTimeAndReward(userId, username, voiceSeconds) {
+  const safeSeconds = Math.max(0, Number(voiceSeconds) || 0);
+  const earnedCoins = Math.floor(
+    (safeSeconds / 3600) * VOICE_COIN_RATE_PER_HOUR
+  );
+
+  await pool.query(
+    `
+    INSERT INTO voice_totals (user_id, username, total_seconds, coins, updated_at)
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      total_seconds = voice_totals.total_seconds + $3,
+      coins = voice_totals.coins + $4,
+      username = $2,
+      updated_at = $5
+    `,
+    [userId, username, safeSeconds, earnedCoins, Date.now()]
+  );
+
+  if (earnedCoins > 0) {
+    await addCoins(userId, username, earnedCoins);
+  }
+
+  return earnedCoins;
+}
+
+async function getVoiceRankingEmbed() {
+  const result = await pool.query(`
+    SELECT user_id, username, total_seconds, coins
+    FROM voice_totals
+    WHERE total_seconds > 0
+    ORDER BY total_seconds DESC
+    LIMIT 25
+  `);
+
+  const embed = new EmbedBuilder()
+    .setTitle("🎧 語音在線時長排行榜")
+    .setColor(0x66c5eb)
+    .setFooter({ text: "WorkTime Bot Voice Online System｜最多顯示 25 位" })
+    .setTimestamp();
+
+  if (result.rows.length === 0) {
+    embed.setDescription("目前還沒有任何語音在線累積紀錄。");
+    return embed;
+  }
+
+  let description = "";
+
+  result.rows.forEach((row, index) => {
+    const medal =
+      index === 0 ? "🥇" : index === 1 ? "🥈" : index === 2 ? "🥉" : `#${index + 1}`;
+
+    const active = voiceStartTimes.get(row.user_id);
+    const activeSeconds = active
+      ? Math.floor((Date.now() - active.startTime) / 1000)
+      : 0;
+
+    const totalWithActive = Number(row.total_seconds) + activeSeconds;
+
+    description += `${medal} <@${row.user_id}>｜${formatTime(totalWithActive)}｜🪙 ${formatCoins(row.coins)}\n`;
+  });
+
+  if (voiceStartTimes.size > 0) {
+    description += "\n━━━━━━━━━━━━━━━━━━━━\n";
+    description += "🟢 **目前正在語音中：**\n";
+
+    let count = 0;
+
+    for (const [userId, session] of voiceStartTimes) {
+      if (count >= 25) break;
+
+      const sec = Math.floor((Date.now() - session.startTime) / 1000);
+      description += `<@${userId}>｜本次在線 ${formatTime(sec)}\n`;
+      count++;
+    }
+  }
+
+  embed.setDescription(description);
+  return embed;
 }
 
 async function addPeriodWork(userId, username, sec) {
@@ -1896,8 +2038,8 @@ function getPanel() {
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
         [
-          "** 💼 命苦上班打工人系統已成功部屬**",
-          "** <:SPACE:1506460111856468070> 第 1 頁：上下班功能頁**",
+          "### 💼 命苦上班打工人系統已成功部屬",
+          "### <:SPACE:1506460111856468070> 第 1 頁：上下班功能頁",
         ].join("\n")
       )
     )
@@ -1940,8 +2082,8 @@ function getPanelMore() {
     .addTextDisplayComponents(
       new TextDisplayBuilder().setContent(
         [
-          "** 💼 命苦上班打工人系統已成功部屬**",
-          "** <:SPACE:1506460111856468070> 第 2 頁：更多功能頁**",
+          "### 💼 命苦上班打工人系統已成功部屬",
+          "### <:SPACE:1506460111856468070> 第 2 頁：更多功能頁",
         ].join("\n")
       )
     )
@@ -2141,6 +2283,25 @@ client.once(Events.ClientReady, async () => {
     `);
 
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS active_voice_sessions (
+        user_id TEXT PRIMARY KEY,
+        username TEXT,
+        channel_id TEXT,
+        start_time BIGINT NOT NULL
+      );
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS voice_totals (
+        user_id TEXT PRIMARY KEY,
+        username TEXT,
+        total_seconds BIGINT DEFAULT 0,
+        coins BIGINT DEFAULT 0,
+        updated_at BIGINT
+      );
+    `);
+
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS work_monthly_totals (
         period_key TEXT NOT NULL,
         user_id TEXT NOT NULL,
@@ -2232,6 +2393,7 @@ client.once(Events.ClientReady, async () => {
     `);
 
     await loadActiveSessions();
+    await loadActiveVoiceSessions();
 
     console.log("資料表確認完成");
 
@@ -2244,6 +2406,88 @@ client.once(Events.ClientReady, async () => {
     startPanelRefreshTimer();
   } catch (error) {
     console.error("資料表確認失敗：", error);
+  }
+});
+
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  try {
+    const member = newState.member || oldState.member;
+    if (!member || member.user.bot) return;
+
+    const userId = member.user.id;
+    const username = member.user.username;
+
+    const oldChannelId = oldState.channelId;
+    const newChannelId = newState.channelId;
+
+    // 進入語音頻道
+    if (!oldChannelId && newChannelId) {
+      const startTime = Date.now();
+
+      voiceStartTimes.set(userId, {
+        username,
+        channelId: newChannelId,
+        startTime,
+      });
+
+      await saveActiveVoiceSession(userId, username, newChannelId, startTime);
+
+      console.log(`${username} 進入語音頻道，開始累積語音在線時間。`);
+      return;
+    }
+
+    // 離開語音頻道
+    if (oldChannelId && !newChannelId) {
+      const session = voiceStartTimes.get(userId);
+
+      if (!session) {
+        await removeActiveVoiceSession(userId);
+        return;
+      }
+
+      const voiceSeconds = Math.floor((Date.now() - session.startTime) / 1000);
+      const earnedCoins = await addVoiceTimeAndReward(
+        userId,
+        username,
+        voiceSeconds
+      );
+
+      voiceStartTimes.delete(userId);
+      await removeActiveVoiceSession(userId);
+
+      console.log(
+        `${username} 離開語音頻道，本次在線 ${formatTime(
+          voiceSeconds
+        )}，獲得 ${earnedCoins} 金幣。`
+      );
+
+      return;
+    }
+
+    // 切換語音頻道，不重置時間，只更新 channel_id
+    if (oldChannelId && newChannelId && oldChannelId !== newChannelId) {
+      const session = voiceStartTimes.get(userId);
+
+      if (session) {
+        session.channelId = newChannelId;
+        voiceStartTimes.set(userId, session);
+        await updateActiveVoiceChannel(userId, newChannelId);
+      } else {
+        const startTime = Date.now();
+
+        voiceStartTimes.set(userId, {
+          username,
+          channelId: newChannelId,
+          startTime,
+        });
+
+        await saveActiveVoiceSession(userId, username, newChannelId, startTime);
+      }
+
+      console.log(`${username} 切換語音頻道，語音在線時間繼續累積。`);
+    }
+  } catch (error) {
+    console.error("處理語音狀態更新時發生錯誤：", error);
   }
 });
 
@@ -2737,6 +2981,32 @@ if (clearPending || moodPending || coinPending) {
     if (c === "!我的狀態") {
       const embed = await getSelfStatusEmbed(msg.author);
       msg.reply({ embeds: [embed] });
+      return;
+    }
+
+    if (c === "!wt voice") {
+      const embed = await getVoiceRankingEmbed();
+      msg.reply({ embeds: [embed] });
+      return;
+    }
+
+    if (c.startsWith("!wt voice clear")) {
+      if (!isAdmin(msg.member)) {
+        msg.reply("你沒有權限使用這個指令。");
+        return;
+      }
+
+      const u = msg.mentions.users.first();
+
+      if (!u) {
+        msg.reply("格式錯誤：`!wt voice clear @人`");
+        return;
+      }
+
+      voiceStartTimes.delete(u.id);
+      await removeActiveVoiceSession(u.id);
+
+      msg.reply(`已清除 ${u.username} 目前進行中的語音在線紀錄。`);
       return;
     }
 

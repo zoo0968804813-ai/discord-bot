@@ -694,6 +694,160 @@ async function getVoiceRankingEmbed() {
   return embed;
 }
 
+function getWtHelpEmbed() {
+  return new EmbedBuilder()
+    .setTitle("📘 WorkTime Bot 使用說明")
+    .setColor(0x66c5eb)
+    .setDescription(
+      [
+        "目前一般玩家主要使用 **固定面板** 與 Slash 指令操作。",
+        "",
+        "## 💼 固定面板功能",
+        "🟢 **開始上班**｜開始紀錄上班時間",
+        "🔴 **完成下班**｜結算工時與金幣",
+        "📋 **上班查詢**｜查看目前正在上班的人",
+        "👤 **我的狀態**｜查看自己的工時、金幣、等級、稱號、心情",
+        "🏆 **工時排行**｜查看總排行榜、月排行榜、週排行榜",
+        "",
+        "## 🔹 Slash 指令",
+        "`/wt bank`｜開啟 Hizu Jin 信託商業銀行",
+        "`/wt voice`｜查看語音在線時長排行榜",
+        "`/wt help`｜查看本說明",
+        "",
+        "## 🎧 語音在線",
+        "進入語音頻道會累積語音在線時間。",
+        `每在線 1 小時可獲得 🪙 ${VOICE_COIN_RATE_PER_HOUR} 金幣。`,
+        "語音時間不會加入打工總工時排行榜。",
+        "",
+        "## 💬 自然語句",
+        "你仍然可以直接輸入：",
+        "`上班`、`下班`",
+      ].join("\n")
+    )
+    .setFooter({ text: "WorkTime Bot Help" })
+    .setTimestamp();
+}
+
+function getWtAdminHelpEmbed() {
+  return new EmbedBuilder()
+    .setTitle("🛠️ WorkTime Bot 管理員指令說明")
+    .setColor(0xe67e22)
+    .setDescription(
+      [
+        "以下指令僅限管理員使用。",
+        "",
+        "## ⏱️ 工作時間管理",
+        "`/wt-admin worktime add`｜增加指定用戶工作時間",
+        "`/wt-admin worktime reduce`｜減少指定用戶工作時間",
+        "`/wt-admin worktime clear`｜清除指定用戶工作時間",
+        "",
+        "時間輸入使用：",
+        "`hours` 小時、`minutes` 分鐘、`seconds` 秒",
+        "",
+        "## 💭 心情指數管理",
+        "`/wt-admin mood add`｜增加指定用戶心情指數",
+        "`/wt-admin mood reduce`｜減少指定用戶心情指數",
+        "`/wt-admin mood clear`｜清除指定用戶心情指數",
+        "",
+        "## 🪙 金幣管理",
+        "`/wt-admin coin add`｜增加指定用戶金幣",
+        "`/wt-admin coin reduce`｜減少指定用戶金幣",
+        "`/wt-admin coin clear`｜清除指定用戶金幣",
+        "",
+        "## 💼 強制上下班",
+        "`/wt-admin force start`｜強制指定用戶上班",
+        "`/wt-admin force end`｜強制指定用戶下班",
+        "",
+        "## 📌 Panel 管理",
+        "`/wt-admin panel-refresh`｜立即刷新 Panel，並設定每小時固定刷新時間",
+        "",
+        "例如現在是 15:51，設定 `minute:30 second:0`：",
+        "會立即刷新一次，下一次刷新為 16:30，之後 17:30、18:30。",
+        "",
+        "## 🎧 語音暫存管理",
+        "`/wt-admin voice-clear`｜清除指定用戶目前語音在線暫存紀錄",
+        "",
+        "此操作不會清除永久語音累積時長，也不會清除金幣。",
+      ].join("\n")
+    )
+    .setFooter({ text: "WorkTime Bot Admin Help" })
+    .setTimestamp();
+}
+
+function getDeprecatedTextCommandMessage(content) {
+  const c = content.trim();
+
+  if (c === "!面板") {
+    return "此文字指令已停用。Panel 會自動刷新在指定頻道。";
+  }
+
+  if (c === "!查詢") {
+    return "此文字指令已停用。請使用固定面板中的「上班查詢」。";
+  }
+
+  if (c === "!排行榜") {
+    return "此文字指令已停用。請使用固定面板中的「工時排行」。";
+  }
+
+  if (c === "!我的狀態") {
+    return "此文字指令已停用。請使用固定面板中的「我的狀態」。";
+  }
+
+  if (c === "!幫助") {
+    return "此文字指令已停用。請改用 `/wt help`。";
+  }
+
+  if (c === "!wt voice") {
+    return "此文字指令已停用。請改用 `/wt voice`。";
+  }
+
+  if (c.startsWith("!wt voice clear")) {
+    return "此文字指令已停用。請改用 `/wt-admin voice-clear`。";
+  }
+
+  if (c.startsWith("!wt refresh panel")) {
+    return "此文字指令已停用。請改用 `/wt-admin panel-refresh`。";
+  }
+
+  if (c === "!wt panel timer") {
+    return "此文字指令已停用。`panel-timer` 已不再提供，請使用 `/wt-admin panel-refresh` 設定固定刷新時間。";
+  }
+
+  if (c.startsWith("!wt add worktime")) {
+    return "此文字指令已停用。請改用 `/wt-admin worktime add`，並使用 hours / minutes / seconds 輸入時間。";
+  }
+
+  if (c.startsWith("!wt remove worktime")) {
+    return "此文字指令已停用。請改用 `/wt-admin worktime clear`。";
+  }
+
+  if (c.startsWith("!wt add workmood")) {
+    return "此文字指令已停用。請改用 `/wt-admin mood add`。";
+  }
+
+  if (c.startsWith("!wt remove workmood")) {
+    return "此文字指令已停用。請改用 `/wt-admin mood clear`。";
+  }
+
+  if (c.startsWith("!wt add coin")) {
+    return "此文字指令已停用。請改用 `/wt-admin coin add`。";
+  }
+
+  if (c.startsWith("!wt remove coin")) {
+    return "此文字指令已停用。請改用 `/wt-admin coin clear`。";
+  }
+
+  if (c.startsWith("!強制上班")) {
+    return "此文字指令已停用。請改用 `/wt-admin force start`。";
+  }
+
+  if (c.startsWith("!強制下班")) {
+    return "此文字指令已停用。請改用 `/wt-admin force end`。";
+  }
+
+  return null;
+}
+
 async function addPeriodWork(userId, username, sec) {
   const monthlyPeriodKey = getMonthlyPeriodKey();
   const weeklyPeriodKey = getWeeklyPeriodKey();
@@ -1673,6 +1827,14 @@ async function handleWtAdminCommand(interaction) {
   const group = interaction.options.getSubcommandGroup(false);
   const sub = interaction.options.getSubcommand();
 
+  if (!group && sub === "help") {
+    await interaction.reply({
+      embeds: [getWtAdminHelpEmbed()],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
   if (group === "worktime") {
     const user = interaction.options.getUser("user");
 
@@ -1949,6 +2111,9 @@ async function registerSlashCommands() {
       .addSubcommand((sub) =>
         sub.setName("voice").setDescription("查看語音在線時長排行榜")
       )
+      .addSubcommand((sub) =>
+        sub.setName("help").setDescription("查看 WorkTime Bot 使用說明")
+      )
       .addSubcommandGroup((group) =>
         group
           .setName("bank-admin")
@@ -2037,6 +2202,9 @@ async function registerSlashCommands() {
     new SlashCommandBuilder()
       .setName("wt-admin")
       .setDescription("WorkTime Bot 管理員指令")
+      .addSubcommand((sub) =>
+        sub.setName("help").setDescription("查看 WorkTime Bot 管理員指令說明")
+      )
       .addSubcommandGroup((group) =>
         group
           .setName("worktime")
@@ -3196,6 +3364,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return;
       }
 
+      if (sub === "help") {
+        await interaction.reply({
+          embeds: [getWtHelpEmbed()],
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
       return;
     }
 
@@ -3582,6 +3757,11 @@ client.on("messageCreate", async (msg) => {
     if (!isAllowedChannel(msg.channel.id)) return;
 
     const c = msg.content.trim();
+    const deprecatedMessage = getDeprecatedTextCommandMessage(c);
+    if (deprecatedMessage) {
+      msg.reply(deprecatedMessage);
+      return;
+    }
     const uid = msg.author.id;
     const now = Date.now();
 

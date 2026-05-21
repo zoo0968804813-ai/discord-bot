@@ -57,7 +57,13 @@ const MAX_LOAN_INSTALLMENTS = 72;
 
 let panelRefreshTimer = null;
 let panelNextRefreshAt = null;
-const PANEL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+
+// 預設仍維持舊版：每 1 小時刷新一次。
+// 當管理員使用 /wt-admin panel-refresh minute:x second:y 後，會切換成「每小時固定第 x 分 y 秒刷新」。
+let panelRefreshMode = "interval";
+let panelRefreshIntervalMs = 60 * 60 * 1000;
+let panelRefreshFixedMinute = 0;
+let panelRefreshFixedSecond = 0;
 
 let rankingRewardTimer = null;
 const RANKING_REWARD_CHECK_INTERVAL_MS = 10 * 60 * 1000;
@@ -788,6 +794,121 @@ async function clearCoins(userId) {
 
 async function clearWork(userId) {
   await pool.query(`DELETE FROM work_totals WHERE user_id = $1`, [userId]);
+}
+
+function getDurationSecondsFromOptions(interaction) {
+  const hours = interaction.options.getInteger("hours") || 0;
+  const minutes = interaction.options.getInteger("minutes") || 0;
+  const seconds = interaction.options.getInteger("seconds") || 0;
+
+  const totalSeconds = hours * 3600 + minutes * 60 + seconds;
+
+  return {
+    hours,
+    minutes,
+    seconds,
+    totalSeconds,
+  };
+}
+
+function isConfirmYes(value) {
+  return String(value || "").trim().toUpperCase() === "YES";
+}
+
+async function reduceWorkTime(userId, seconds) {
+  const safeSeconds = Math.max(0, Number(seconds) || 0);
+  const monthlyPeriodKey = getMonthlyPeriodKey();
+  const weeklyPeriodKey = getWeeklyPeriodKey();
+
+  await pool.query(
+    `
+    UPDATE work_totals
+    SET total_seconds = GREATEST(0, total_seconds - $1)
+    WHERE user_id = $2
+    `,
+    [safeSeconds, userId]
+  );
+
+  await pool.query(
+    `
+    UPDATE work_monthly_totals
+    SET total_seconds = GREATEST(0, total_seconds - $1)
+    WHERE user_id = $2 AND period_key = $3
+    `,
+    [safeSeconds, userId, monthlyPeriodKey]
+  );
+
+  await pool.query(
+    `
+    UPDATE work_weekly_totals
+    SET total_seconds = GREATEST(0, total_seconds - $1)
+    WHERE user_id = $2 AND period_key = $3
+    `,
+    [safeSeconds, userId, weeklyPeriodKey]
+  );
+}
+
+async function clearWorkTimeOnly(userId) {
+  workStartTimes.delete(userId);
+
+  await pool.query(
+    `
+    UPDATE work_totals
+    SET total_seconds = 0
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
+
+  await pool.query(
+    `
+    DELETE FROM work_monthly_totals
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
+
+  await pool.query(
+    `
+    DELETE FROM work_weekly_totals
+    WHERE user_id = $1
+    `,
+    [userId]
+  );
+
+  await removeActiveSession(userId);
+}
+
+async function reduceMood(userId, username, amount) {
+  const safeAmount = Math.max(0, Number(amount) || 0);
+
+  await pool.query(
+    `
+    INSERT INTO work_totals (user_id, username, total_seconds, mood_score, coins)
+    VALUES ($1, $2, 0, $3, 0)
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      mood_score = work_totals.mood_score - $3,
+      username = $2
+    `,
+    [userId, username, safeAmount]
+  );
+}
+
+async function reduceCoins(userId, username, amount) {
+  const safeAmount = Math.max(0, Number(amount) || 0);
+
+  await pool.query(
+    `
+    INSERT INTO work_totals (user_id, username, total_seconds, mood_score, coins)
+    VALUES ($1, $2, 0, 0, 0)
+    ON CONFLICT (user_id)
+    DO UPDATE SET
+      coins = GREATEST(0, work_totals.coins - $3),
+      username = $2
+    `,
+    [userId, username, safeAmount]
+  );
 }
 
 async function getCurrentMonthlyBestEmployee() {
@@ -1540,6 +1661,248 @@ async function handleBankAdminCommand(interaction) {
   }
 }
 
+async function handleWtAdminCommand(interaction) {
+  if (!isAdmin(interaction.member)) {
+    await interaction.reply({
+      content: "你沒有權限使用這個指令。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const group = interaction.options.getSubcommandGroup(false);
+  const sub = interaction.options.getSubcommand();
+
+  if (group === "worktime") {
+    const user = interaction.options.getUser("user");
+
+    if (sub === "add") {
+      const duration = getDurationSecondsFromOptions(interaction);
+
+      if (duration.totalSeconds <= 0) {
+        await interaction.reply({
+          content: "請至少輸入一個大於 0 的時間。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await addWork(user.id, user.username, duration.totalSeconds);
+
+      await interaction.reply({
+        content: `已為 ${user.username} 增加工作時間 ${formatTime(
+          duration.totalSeconds
+        )}，並依照打工倍率發放金幣。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === "reduce") {
+      const duration = getDurationSecondsFromOptions(interaction);
+
+      if (duration.totalSeconds <= 0) {
+        await interaction.reply({
+          content: "請至少輸入一個大於 0 的時間。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await reduceWorkTime(user.id, duration.totalSeconds);
+
+      await interaction.reply({
+        content: `已為 ${user.username} 減少工作時間 ${formatTime(
+          duration.totalSeconds
+        )}。此操作不會自動扣回金幣。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === "clear") {
+      const confirm = interaction.options.getString("confirm");
+
+      if (!isConfirmYes(confirm)) {
+        await interaction.reply({
+          content: "確認失敗。若要清除工作時間，confirm 請輸入 `YES`。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await clearWorkTimeOnly(user.id);
+
+      await interaction.reply({
+        content: `已清除 ${user.username} 的工作時間、週/月工時與目前上班中紀錄；金幣與心情不受影響。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+  }
+
+  if (group === "mood") {
+    const user = interaction.options.getUser("user");
+    const amount = interaction.options.getInteger("amount");
+
+    if (sub === "add") {
+      await addMood(user.id, user.username, amount);
+
+      await interaction.reply({
+        content: `已為 ${user.username} 增加心情指數 +${amount}。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === "reduce") {
+      await reduceMood(user.id, user.username, amount);
+
+      await interaction.reply({
+        content: `已為 ${user.username} 減少心情指數 -${amount}。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === "clear") {
+      const confirm = interaction.options.getString("confirm");
+
+      if (!isConfirmYes(confirm)) {
+        await interaction.reply({
+          content: "確認失敗。若要清除心情指數，confirm 請輸入 `YES`。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await resetMood(user.id);
+
+      await interaction.reply({
+        content: `已重置 ${user.username} 的心情指數為 0。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+  }
+
+  if (group === "coin") {
+    const user = interaction.options.getUser("user");
+    const amount = interaction.options.getInteger("amount");
+
+    if (sub === "add") {
+      await addCoins(user.id, user.username, amount);
+
+      await interaction.reply({
+        content: `已為 ${user.username} 增加 🪙 ${formatCoins(amount)} 金幣。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === "reduce") {
+      await reduceCoins(user.id, user.username, amount);
+
+      await interaction.reply({
+        content: `已為 ${user.username} 減少 🪙 ${formatCoins(
+          amount
+        )} 金幣，最低不會低於 0。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === "clear") {
+      const confirm = interaction.options.getString("confirm");
+
+      if (!isConfirmYes(confirm)) {
+        await interaction.reply({
+          content: "確認失敗。若要清除金幣，confirm 請輸入 `YES`。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await clearCoins(user.id);
+
+      await interaction.reply({
+        content: `已清除 ${user.username} 的金幣。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+  }
+
+  if (group === "force") {
+    const user = interaction.options.getUser("user");
+
+    if (sub === "start") {
+      if (workStartTimes.has(user.id)) {
+        await interaction.reply({
+          content: `${user.username} 目前已經在上班中。`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const startTime = Date.now();
+
+      workStartTimes.set(user.id, startTime);
+      await saveActiveSession(user.id, user.username, startTime);
+
+      await interaction.reply({
+        content: `${user.username} 已被強制設定為上班中。`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === "end") {
+      const result = await endWork(user.id, user.username);
+
+      await interaction.reply({
+        content: `${user.username} ${result.text}`,
+        flags: MessageFlags.Ephemeral,
+      });
+
+      if (result.ok) {
+        await sendMoodPrompt(user);
+      }
+
+      return;
+    }
+  }
+
+  if (!group && sub === "panel-refresh") {
+    const minute = interaction.options.getInteger("minute");
+    const second = interaction.options.getInteger("second") || 0;
+
+    await setFixedPanelRefreshTimeAndRunNow(minute, second);
+
+    await interaction.reply({
+      content:
+        `已立即刷新 Panel，並設定之後固定於每小時 ${minute} 分 ${second} 秒刷新。\n` +
+        `下一次刷新剩餘時間：${formatTime(
+          Math.floor(Math.max(0, panelNextRefreshAt - Date.now()) / 1000)
+        )}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (!group && sub === "voice-clear") {
+    const user = interaction.options.getUser("user");
+
+    voiceStartTimes.delete(user.id);
+    await removeActiveVoiceSession(user.id);
+
+    await interaction.reply({
+      content: `已清除 ${user.username} 目前進行中的語音在線暫存紀錄。永久語音累積紀錄不受影響。`,
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+}
+
 async function registerSlashCommands() {
   const clientId = process.env.CLIENT_ID;
   const guildId = process.env.GUILD_ID;
@@ -1550,12 +1913,41 @@ async function registerSlashCommands() {
     return;
   }
 
+  const timeOptions = (sub) =>
+    sub
+      .addIntegerOption((option) =>
+        option
+          .setName("hours")
+          .setDescription("小時，可留空")
+          .setRequired(false)
+          .setMinValue(0)
+      )
+      .addIntegerOption((option) =>
+        option
+          .setName("minutes")
+          .setDescription("分鐘，可留空")
+          .setRequired(false)
+          .setMinValue(0)
+          .setMaxValue(59)
+      )
+      .addIntegerOption((option) =>
+        option
+          .setName("seconds")
+          .setDescription("秒數，可留空")
+          .setRequired(false)
+          .setMinValue(0)
+          .setMaxValue(59)
+      );
+
   const commands = [
     new SlashCommandBuilder()
       .setName("wt")
       .setDescription("WorkTime Bot 指令")
       .addSubcommand((sub) =>
         sub.setName("bank").setDescription("開啟 Hizu Jin 信託商業銀行")
+      )
+      .addSubcommand((sub) =>
+        sub.setName("voice").setDescription("查看語音在線時長排行榜")
       )
       .addSubcommandGroup((group) =>
         group
@@ -1639,6 +2031,233 @@ async function registerSlashCommands() {
                   .setDescription("分期期數，最多72期")
                   .setRequired(true)
               )
+          )
+      ),
+
+    new SlashCommandBuilder()
+      .setName("wt-admin")
+      .setDescription("WorkTime Bot 管理員指令")
+      .addSubcommandGroup((group) =>
+        group
+          .setName("worktime")
+          .setDescription("管理工作時間")
+          .addSubcommand((sub) =>
+            timeOptions(
+              sub
+                .setName("add")
+                .setDescription("增加指定用戶工作時間")
+                .addUserOption((option) =>
+                  option
+                    .setName("user")
+                    .setDescription("指定用戶")
+                    .setRequired(true)
+                )
+            )
+          )
+          .addSubcommand((sub) =>
+            timeOptions(
+              sub
+                .setName("reduce")
+                .setDescription("減少指定用戶工作時間")
+                .addUserOption((option) =>
+                  option
+                    .setName("user")
+                    .setDescription("指定用戶")
+                    .setRequired(true)
+                )
+            )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("clear")
+              .setDescription("清除指定用戶工作時間")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+              .addStringOption((option) =>
+                option
+                  .setName("confirm")
+                  .setDescription("請輸入 YES 確認")
+                  .setRequired(true)
+              )
+          )
+      )
+      .addSubcommandGroup((group) =>
+        group
+          .setName("mood")
+          .setDescription("管理工作心情")
+          .addSubcommand((sub) =>
+            sub
+              .setName("add")
+              .setDescription("增加指定用戶心情指數")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+              .addIntegerOption((option) =>
+                option
+                  .setName("amount")
+                  .setDescription("增加數量")
+                  .setRequired(true)
+                  .setMinValue(1)
+              )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("reduce")
+              .setDescription("減少指定用戶心情指數")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+              .addIntegerOption((option) =>
+                option
+                  .setName("amount")
+                  .setDescription("減少數量")
+                  .setRequired(true)
+                  .setMinValue(1)
+              )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("clear")
+              .setDescription("清除指定用戶心情指數")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+              .addStringOption((option) =>
+                option
+                  .setName("confirm")
+                  .setDescription("請輸入 YES 確認")
+                  .setRequired(true)
+              )
+          )
+      )
+      .addSubcommandGroup((group) =>
+        group
+          .setName("coin")
+          .setDescription("管理金幣")
+          .addSubcommand((sub) =>
+            sub
+              .setName("add")
+              .setDescription("增加指定用戶金幣")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+              .addIntegerOption((option) =>
+                option
+                  .setName("amount")
+                  .setDescription("增加金幣數量")
+                  .setRequired(true)
+                  .setMinValue(1)
+              )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("reduce")
+              .setDescription("減少指定用戶金幣")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+              .addIntegerOption((option) =>
+                option
+                  .setName("amount")
+                  .setDescription("減少金幣數量")
+                  .setRequired(true)
+                  .setMinValue(1)
+              )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("clear")
+              .setDescription("清除指定用戶金幣")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+              .addStringOption((option) =>
+                option
+                  .setName("confirm")
+                  .setDescription("請輸入 YES 確認")
+                  .setRequired(true)
+              )
+          )
+      )
+      .addSubcommandGroup((group) =>
+        group
+          .setName("force")
+          .setDescription("強制上下班")
+          .addSubcommand((sub) =>
+            sub
+              .setName("start")
+              .setDescription("強制指定用戶上班")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+          )
+          .addSubcommand((sub) =>
+            sub
+              .setName("end")
+              .setDescription("強制指定用戶下班")
+              .addUserOption((option) =>
+                option
+                  .setName("user")
+                  .setDescription("指定用戶")
+                  .setRequired(true)
+              )
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("panel-refresh")
+          .setDescription("立即刷新 Panel，並設定每小時固定刷新時間")
+          .addIntegerOption((option) =>
+            option
+              .setName("minute")
+              .setDescription("每小時第幾分刷新，0~59")
+              .setRequired(true)
+              .setMinValue(0)
+              .setMaxValue(59)
+          )
+          .addIntegerOption((option) =>
+            option
+              .setName("second")
+              .setDescription("第幾秒刷新，0~59，預設 0")
+              .setRequired(false)
+              .setMinValue(0)
+              .setMaxValue(59)
+          )
+      )
+      .addSubcommand((sub) =>
+        sub
+          .setName("voice-clear")
+          .setDescription("清除指定用戶目前語音在線暫存紀錄")
+          .addUserOption((option) =>
+            option
+              .setName("user")
+              .setDescription("指定用戶")
+              .setRequired(true)
           )
       ),
   ].map((command) => command.toJSON());
@@ -2173,27 +2792,60 @@ async function refreshPanelChannel() {
   console.log(`面板頻道已刷新，刪除 ${deletedTotal} 則訊息並重新發送面板。`);
 }
 
-function startPanelRefreshTimer() {
-  if (panelRefreshTimer) {
-    clearInterval(panelRefreshTimer);
+function calculateNextFixedPanelRefreshAt(date = new Date()) {
+  const next = new Date(date);
+
+  next.setMinutes(panelRefreshFixedMinute);
+  next.setSeconds(panelRefreshFixedSecond);
+  next.setMilliseconds(0);
+
+  if (next.getTime() <= date.getTime()) {
+    next.setHours(next.getHours() + 1);
   }
 
-  panelNextRefreshAt = Date.now() + PANEL_REFRESH_INTERVAL_MS;
+  return next.getTime();
+}
 
-  panelRefreshTimer = setInterval(async () => {
+function scheduleNextPanelRefresh() {
+  if (panelRefreshTimer) {
+    clearTimeout(panelRefreshTimer);
+  }
+
+  if (panelRefreshMode === "fixed") {
+    panelNextRefreshAt = calculateNextFixedPanelRefreshAt();
+  } else {
+    panelNextRefreshAt = Date.now() + panelRefreshIntervalMs;
+  }
+
+  const delayMs = Math.max(1000, panelNextRefreshAt - Date.now());
+
+  panelRefreshTimer = setTimeout(async () => {
     try {
       await refreshPanelChannel();
-      panelNextRefreshAt = Date.now() + PANEL_REFRESH_INTERVAL_MS;
     } catch (error) {
       console.error("自動刷新面板時發生錯誤：", error);
-      panelNextRefreshAt = Date.now() + PANEL_REFRESH_INTERVAL_MS;
+    } finally {
+      scheduleNextPanelRefresh();
     }
-  }, PANEL_REFRESH_INTERVAL_MS);
+  }, delayMs);
+}
+
+function startPanelRefreshTimer() {
+  scheduleNextPanelRefresh();
 }
 
 async function resetPanelRefreshTimerAndRunNow() {
   await refreshPanelChannel();
-  startPanelRefreshTimer();
+  scheduleNextPanelRefresh();
+}
+
+async function setFixedPanelRefreshTimeAndRunNow(minute, second = 0) {
+  panelRefreshMode = "fixed";
+  panelRefreshFixedMinute = minute;
+  panelRefreshFixedSecond = second;
+
+  await refreshPanelChannel();
+  scheduleNextPanelRefresh();
 }
 
 function getPanelRefreshRemainingText() {
@@ -2203,6 +2855,12 @@ function getPanelRefreshRemainingText() {
 
   const remainingMs = Math.max(0, panelNextRefreshAt - Date.now());
   const totalSeconds = Math.floor(remainingMs / 1000);
+
+  if (panelRefreshMode === "fixed") {
+    return `距離下一次面板清空與重發還剩：${formatTime(
+      totalSeconds
+    )}\n目前固定刷新時間：每小時 ${panelRefreshFixedMinute} 分 ${panelRefreshFixedSecond} 秒`;
+  }
 
   return `距離下一次面板清空與重發還剩：${formatTime(totalSeconds)}`;
 }
@@ -2494,8 +3152,6 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
-      if (interaction.commandName !== "wt") return;
-
       if (interaction.inGuild() && !isAllowedChannel(interaction.channelId)) {
         await interaction.reply({
           content: "這個頻道不能使用此指令。",
@@ -2503,6 +3159,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
         return;
       }
+
+      if (interaction.commandName === "wt-admin") {
+        await handleWtAdminCommand(interaction);
+        return;
+      }
+
+      if (interaction.commandName !== "wt") return;
 
       const group = interaction.options.getSubcommandGroup(false);
       const sub = interaction.options.getSubcommand();
@@ -2518,6 +3181,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({
           embeds: [embed],
           components: [getBankMainButtons()],
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (sub === "voice") {
+        const embed = await getVoiceRankingEmbed();
+
+        await interaction.reply({
+          embeds: [embed],
           flags: MessageFlags.Ephemeral,
         });
         return;

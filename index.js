@@ -737,37 +737,36 @@ function getWtAdminHelpEmbed() {
         "以下指令僅限管理員使用。",
         "",
         "## ⏱️ 工作時間管理",
-        "`/wt-admin worktime add`｜增加指定用戶工作時間",
-        "`/wt-admin worktime reduce`｜減少指定用戶工作時間",
-        "`/wt-admin worktime clear`｜清除指定用戶工作時間",
+        "`/wt-admin worktime action:add user:@人 hours:1 minutes:30 seconds:0`",
+        "增加指定用戶工作時間，並依照打工倍率發放金幣。",
         "",
-        "時間輸入使用：",
-        "`hours` 小時、`minutes` 分鐘、`seconds` 秒",
+        "`/wt-admin worktime action:reduce user:@人 hours:1 minutes:30 seconds:0`",
+        "減少指定用戶工作時間，不會自動扣回金幣。",
+        "",
+        "`/wt-admin worktime action:clear user:@人 confirm:YES`",
+        "清除指定用戶工作時間、週/月工時與目前上班中紀錄。",
         "",
         "## 💭 心情指數管理",
-        "`/wt-admin mood add`｜增加指定用戶心情指數",
-        "`/wt-admin mood reduce`｜減少指定用戶心情指數",
-        "`/wt-admin mood clear`｜清除指定用戶心情指數",
+        "`/wt-admin mood action:add user:@人 amount:5`",
+        "`/wt-admin mood action:reduce user:@人 amount:5`",
+        "`/wt-admin mood action:clear user:@人 confirm:YES`",
         "",
         "## 🪙 金幣管理",
-        "`/wt-admin coin add`｜增加指定用戶金幣",
-        "`/wt-admin coin reduce`｜減少指定用戶金幣",
-        "`/wt-admin coin clear`｜清除指定用戶金幣",
+        "`/wt-admin coin action:add user:@人 amount:100`",
+        "`/wt-admin coin action:reduce user:@人 amount:100`",
+        "`/wt-admin coin action:clear user:@人 confirm:YES`",
         "",
         "## 💼 強制上下班",
-        "`/wt-admin force start`｜強制指定用戶上班",
-        "`/wt-admin force end`｜強制指定用戶下班",
+        "`/wt-admin force action:start user:@人`",
+        "`/wt-admin force action:end user:@人`",
         "",
         "## 📌 Panel 管理",
-        "`/wt-admin panel-refresh`｜立即刷新 Panel，並設定每小時固定刷新時間",
-        "",
-        "例如現在是 15:51，設定 `minute:30 second:0`：",
-        "會立即刷新一次，下一次刷新為 16:30，之後 17:30、18:30。",
+        "`/wt-admin panel-refresh minute:30 second:0`",
+        "立即刷新一次，之後固定每小時第 30 分 0 秒刷新。",
         "",
         "## 🎧 語音暫存管理",
-        "`/wt-admin voice-clear`｜清除指定用戶目前語音在線暫存紀錄",
-        "",
-        "此操作不會清除永久語音累積時長，也不會清除金幣。",
+        "`/wt-admin voice-clear user:@人`",
+        "清除指定用戶目前語音在線暫存紀錄，不影響永久語音累積。",
       ].join("\n")
     )
     .setFooter({ text: "WorkTime Bot Admin Help" })
@@ -1824,10 +1823,9 @@ async function handleWtAdminCommand(interaction) {
     return;
   }
 
-  const group = interaction.options.getSubcommandGroup(false);
   const sub = interaction.options.getSubcommand();
 
-  if (!group && sub === "help") {
+  if (sub === "help") {
     await interaction.reply({
       embeds: [getWtAdminHelpEmbed()],
       flags: MessageFlags.Ephemeral,
@@ -1835,12 +1833,13 @@ async function handleWtAdminCommand(interaction) {
     return;
   }
 
-  if (group === "worktime") {
+  if (sub === "worktime") {
+    const action = interaction.options.getString("action");
     const user = interaction.options.getUser("user");
+    const confirm = interaction.options.getString("confirm");
+    const duration = getDurationSecondsFromOptions(interaction);
 
-    if (sub === "add") {
-      const duration = getDurationSecondsFromOptions(interaction);
-
+    if (action === "add") {
       if (duration.totalSeconds <= 0) {
         await interaction.reply({
           content: "請至少輸入一個大於 0 的時間。",
@@ -1860,9 +1859,7 @@ async function handleWtAdminCommand(interaction) {
       return;
     }
 
-    if (sub === "reduce") {
-      const duration = getDurationSecondsFromOptions(interaction);
-
+    if (action === "reduce") {
       if (duration.totalSeconds <= 0) {
         await interaction.reply({
           content: "請至少輸入一個大於 0 的時間。",
@@ -1882,9 +1879,7 @@ async function handleWtAdminCommand(interaction) {
       return;
     }
 
-    if (sub === "clear") {
-      const confirm = interaction.options.getString("confirm");
-
+    if (action === "clear") {
       if (!isConfirmYes(confirm)) {
         await interaction.reply({
           content: "確認失敗。若要清除工作時間，confirm 請輸入 `YES`。",
@@ -1903,11 +1898,21 @@ async function handleWtAdminCommand(interaction) {
     }
   }
 
-  if (group === "mood") {
+  if (sub === "mood") {
+    const action = interaction.options.getString("action");
     const user = interaction.options.getUser("user");
     const amount = interaction.options.getInteger("amount");
+    const confirm = interaction.options.getString("confirm");
 
-    if (sub === "add") {
+    if (action === "add") {
+      if (!amount || amount <= 0) {
+        await interaction.reply({
+          content: "請輸入要增加的心情數值 amount。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
       await addMood(user.id, user.username, amount);
 
       await interaction.reply({
@@ -1917,7 +1922,15 @@ async function handleWtAdminCommand(interaction) {
       return;
     }
 
-    if (sub === "reduce") {
+    if (action === "reduce") {
+      if (!amount || amount <= 0) {
+        await interaction.reply({
+          content: "請輸入要減少的心情數值 amount。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
       await reduceMood(user.id, user.username, amount);
 
       await interaction.reply({
@@ -1927,9 +1940,7 @@ async function handleWtAdminCommand(interaction) {
       return;
     }
 
-    if (sub === "clear") {
-      const confirm = interaction.options.getString("confirm");
-
+    if (action === "clear") {
       if (!isConfirmYes(confirm)) {
         await interaction.reply({
           content: "確認失敗。若要清除心情指數，confirm 請輸入 `YES`。",
@@ -1948,11 +1959,21 @@ async function handleWtAdminCommand(interaction) {
     }
   }
 
-  if (group === "coin") {
+  if (sub === "coin") {
+    const action = interaction.options.getString("action");
     const user = interaction.options.getUser("user");
     const amount = interaction.options.getInteger("amount");
+    const confirm = interaction.options.getString("confirm");
 
-    if (sub === "add") {
+    if (action === "add") {
+      if (!amount || amount <= 0) {
+        await interaction.reply({
+          content: "請輸入要增加的金幣數量 amount。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
       await addCoins(user.id, user.username, amount);
 
       await interaction.reply({
@@ -1962,7 +1983,15 @@ async function handleWtAdminCommand(interaction) {
       return;
     }
 
-    if (sub === "reduce") {
+    if (action === "reduce") {
+      if (!amount || amount <= 0) {
+        await interaction.reply({
+          content: "請輸入要減少的金幣數量 amount。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
       await reduceCoins(user.id, user.username, amount);
 
       await interaction.reply({
@@ -1974,9 +2003,7 @@ async function handleWtAdminCommand(interaction) {
       return;
     }
 
-    if (sub === "clear") {
-      const confirm = interaction.options.getString("confirm");
-
+    if (action === "clear") {
       if (!isConfirmYes(confirm)) {
         await interaction.reply({
           content: "確認失敗。若要清除金幣，confirm 請輸入 `YES`。",
@@ -1995,10 +2022,11 @@ async function handleWtAdminCommand(interaction) {
     }
   }
 
-  if (group === "force") {
+  if (sub === "force") {
+    const action = interaction.options.getString("action");
     const user = interaction.options.getUser("user");
 
-    if (sub === "start") {
+    if (action === "start") {
       if (workStartTimes.has(user.id)) {
         await interaction.reply({
           content: `${user.username} 目前已經在上班中。`,
@@ -2019,7 +2047,7 @@ async function handleWtAdminCommand(interaction) {
       return;
     }
 
-    if (sub === "end") {
+    if (action === "end") {
       const result = await endWork(user.id, user.username);
 
       await interaction.reply({
@@ -2035,7 +2063,7 @@ async function handleWtAdminCommand(interaction) {
     }
   }
 
-  if (!group && sub === "panel-refresh") {
+  if (sub === "panel-refresh") {
     const minute = interaction.options.getInteger("minute");
     const second = interaction.options.getInteger("second") || 0;
 
@@ -2052,7 +2080,7 @@ async function handleWtAdminCommand(interaction) {
     return;
   }
 
-  if (!group && sub === "voice-clear") {
+  if (sub === "voice-clear") {
     const user = interaction.options.getUser("user");
 
     voiceStartTimes.delete(user.id);
@@ -2062,6 +2090,7 @@ async function handleWtAdminCommand(interaction) {
       content: `已清除 ${user.username} 目前進行中的語音在線暫存紀錄。永久語音累積紀錄不受影響。`,
       flags: MessageFlags.Ephemeral,
     });
+    return;
   }
 }
 
@@ -2074,32 +2103,6 @@ async function registerSlashCommands() {
     console.log("未設定 CLIENT_ID / GUILD_ID / TOKEN，略過 Slash Command 註冊。");
     return;
   }
-
-  const timeOptions = (sub) =>
-    sub
-      .addIntegerOption((option) =>
-        option
-          .setName("hours")
-          .setDescription("小時，可留空")
-          .setRequired(false)
-          .setMinValue(0)
-      )
-      .addIntegerOption((option) =>
-        option
-          .setName("minutes")
-          .setDescription("分鐘，可留空")
-          .setRequired(false)
-          .setMinValue(0)
-          .setMaxValue(59)
-      )
-      .addIntegerOption((option) =>
-        option
-          .setName("seconds")
-          .setDescription("秒數，可留空")
-          .setRequired(false)
-          .setMinValue(0)
-          .setMaxValue(59)
-      );
 
   const commands = [
     new SlashCommandBuilder()
@@ -2202,200 +2205,157 @@ async function registerSlashCommands() {
     new SlashCommandBuilder()
       .setName("wt-admin")
       .setDescription("WorkTime Bot 管理員指令")
+
       .addSubcommand((sub) =>
         sub.setName("help").setDescription("查看 WorkTime Bot 管理員指令說明")
       )
-      .addSubcommandGroup((group) =>
-        group
+
+      .addSubcommand((sub) =>
+        sub
           .setName("worktime")
-          .setDescription("管理工作時間")
-          .addSubcommand((sub) =>
-            timeOptions(
-              sub
-                .setName("add")
-                .setDescription("增加指定用戶工作時間")
-                .addUserOption((option) =>
-                  option
-                    .setName("user")
-                    .setDescription("指定用戶")
-                    .setRequired(true)
-                )
-            )
-          )
-          .addSubcommand((sub) =>
-            timeOptions(
-              sub
-                .setName("reduce")
-                .setDescription("減少指定用戶工作時間")
-                .addUserOption((option) =>
-                  option
-                    .setName("user")
-                    .setDescription("指定用戶")
-                    .setRequired(true)
-                )
-            )
-          )
-          .addSubcommand((sub) =>
-            sub
-              .setName("clear")
-              .setDescription("清除指定用戶工作時間")
-              .addUserOption((option) =>
-                option
-                  .setName("user")
-                  .setDescription("指定用戶")
-                  .setRequired(true)
+          .setDescription("管理指定用戶工作時間")
+          .addStringOption((option) =>
+            option
+              .setName("action")
+              .setDescription("要執行的操作")
+              .setRequired(true)
+              .addChoices(
+                { name: "增加工作時間", value: "add" },
+                { name: "減少工作時間", value: "reduce" },
+                { name: "清除工作時間", value: "clear" }
               )
-              .addStringOption((option) =>
-                option
-                  .setName("confirm")
-                  .setDescription("請輸入 YES 確認")
-                  .setRequired(true)
-              )
+          )
+          .addUserOption((option) =>
+            option
+              .setName("user")
+              .setDescription("指定用戶")
+              .setRequired(true)
+          )
+          .addIntegerOption((option) =>
+            option
+              .setName("hours")
+              .setDescription("小時，可留空")
+              .setRequired(false)
+              .setMinValue(0)
+          )
+          .addIntegerOption((option) =>
+            option
+              .setName("minutes")
+              .setDescription("分鐘，可留空")
+              .setRequired(false)
+              .setMinValue(0)
+              .setMaxValue(59)
+          )
+          .addIntegerOption((option) =>
+            option
+              .setName("seconds")
+              .setDescription("秒數，可留空")
+              .setRequired(false)
+              .setMinValue(0)
+              .setMaxValue(59)
+          )
+          .addStringOption((option) =>
+            option
+              .setName("confirm")
+              .setDescription("清除資料時請輸入 YES")
+              .setRequired(false)
           )
       )
-      .addSubcommandGroup((group) =>
-        group
+
+      .addSubcommand((sub) =>
+        sub
           .setName("mood")
-          .setDescription("管理工作心情")
-          .addSubcommand((sub) =>
-            sub
-              .setName("add")
-              .setDescription("增加指定用戶心情指數")
-              .addUserOption((option) =>
-                option
-                  .setName("user")
-                  .setDescription("指定用戶")
-                  .setRequired(true)
-              )
-              .addIntegerOption((option) =>
-                option
-                  .setName("amount")
-                  .setDescription("增加數量")
-                  .setRequired(true)
-                  .setMinValue(1)
+          .setDescription("管理指定用戶工作心情")
+          .addStringOption((option) =>
+            option
+              .setName("action")
+              .setDescription("要執行的操作")
+              .setRequired(true)
+              .addChoices(
+                { name: "增加心情", value: "add" },
+                { name: "減少心情", value: "reduce" },
+                { name: "清除心情", value: "clear" }
               )
           )
-          .addSubcommand((sub) =>
-            sub
-              .setName("reduce")
-              .setDescription("減少指定用戶心情指數")
-              .addUserOption((option) =>
-                option
-                  .setName("user")
-                  .setDescription("指定用戶")
-                  .setRequired(true)
-              )
-              .addIntegerOption((option) =>
-                option
-                  .setName("amount")
-                  .setDescription("減少數量")
-                  .setRequired(true)
-                  .setMinValue(1)
-              )
+          .addUserOption((option) =>
+            option
+              .setName("user")
+              .setDescription("指定用戶")
+              .setRequired(true)
           )
-          .addSubcommand((sub) =>
-            sub
-              .setName("clear")
-              .setDescription("清除指定用戶心情指數")
-              .addUserOption((option) =>
-                option
-                  .setName("user")
-                  .setDescription("指定用戶")
-                  .setRequired(true)
-              )
-              .addStringOption((option) =>
-                option
-                  .setName("confirm")
-                  .setDescription("請輸入 YES 確認")
-                  .setRequired(true)
-              )
+          .addIntegerOption((option) =>
+            option
+              .setName("amount")
+              .setDescription("增加或減少的心情數值")
+              .setRequired(false)
+              .setMinValue(1)
+          )
+          .addStringOption((option) =>
+            option
+              .setName("confirm")
+              .setDescription("清除資料時請輸入 YES")
+              .setRequired(false)
           )
       )
-      .addSubcommandGroup((group) =>
-        group
+
+      .addSubcommand((sub) =>
+        sub
           .setName("coin")
-          .setDescription("管理金幣")
-          .addSubcommand((sub) =>
-            sub
-              .setName("add")
-              .setDescription("增加指定用戶金幣")
-              .addUserOption((option) =>
-                option
-                  .setName("user")
-                  .setDescription("指定用戶")
-                  .setRequired(true)
-              )
-              .addIntegerOption((option) =>
-                option
-                  .setName("amount")
-                  .setDescription("增加金幣數量")
-                  .setRequired(true)
-                  .setMinValue(1)
+          .setDescription("管理指定用戶金幣")
+          .addStringOption((option) =>
+            option
+              .setName("action")
+              .setDescription("要執行的操作")
+              .setRequired(true)
+              .addChoices(
+                { name: "增加金幣", value: "add" },
+                { name: "減少金幣", value: "reduce" },
+                { name: "清除金幣", value: "clear" }
               )
           )
-          .addSubcommand((sub) =>
-            sub
-              .setName("reduce")
-              .setDescription("減少指定用戶金幣")
-              .addUserOption((option) =>
-                option
-                  .setName("user")
-                  .setDescription("指定用戶")
-                  .setRequired(true)
-              )
-              .addIntegerOption((option) =>
-                option
-                  .setName("amount")
-                  .setDescription("減少金幣數量")
-                  .setRequired(true)
-                  .setMinValue(1)
-              )
+          .addUserOption((option) =>
+            option
+              .setName("user")
+              .setDescription("指定用戶")
+              .setRequired(true)
           )
-          .addSubcommand((sub) =>
-            sub
-              .setName("clear")
-              .setDescription("清除指定用戶金幣")
-              .addUserOption((option) =>
-                option
-                  .setName("user")
-                  .setDescription("指定用戶")
-                  .setRequired(true)
-              )
-              .addStringOption((option) =>
-                option
-                  .setName("confirm")
-                  .setDescription("請輸入 YES 確認")
-                  .setRequired(true)
-              )
+          .addIntegerOption((option) =>
+            option
+              .setName("amount")
+              .setDescription("增加或減少的金幣數量")
+              .setRequired(false)
+              .setMinValue(1)
+          )
+          .addStringOption((option) =>
+            option
+              .setName("confirm")
+              .setDescription("清除資料時請輸入 YES")
+              .setRequired(false)
           )
       )
-      .addSubcommandGroup((group) =>
-        group
+
+      .addSubcommand((sub) =>
+        sub
           .setName("force")
-          .setDescription("強制上下班")
-          .addSubcommand((sub) =>
-            sub
-              .setName("start")
-              .setDescription("強制指定用戶上班")
-              .addUserOption((option) =>
-                option
-                  .setName("user")
-                  .setDescription("指定用戶")
-                  .setRequired(true)
+          .setDescription("強制指定用戶上班或下班")
+          .addStringOption((option) =>
+            option
+              .setName("action")
+              .setDescription("要執行的操作")
+              .setRequired(true)
+              .addChoices(
+                { name: "強制上班", value: "start" },
+                { name: "強制下班", value: "end" }
               )
           )
-          .addSubcommand((sub) =>
-            sub
-              .setName("end")
-              .setDescription("強制指定用戶下班")
-              .addUserOption((option) =>
-                option
-                  .setName("user")
-                  .setDescription("指定用戶")
-                  .setRequired(true)
-              )
+          .addUserOption((option) =>
+            option
+              .setName("user")
+              .setDescription("指定用戶")
+              .setRequired(true)
           )
       )
+
       .addSubcommand((sub) =>
         sub
           .setName("panel-refresh")
@@ -2417,6 +2377,7 @@ async function registerSlashCommands() {
               .setMaxValue(59)
           )
       )
+
       .addSubcommand((sub) =>
         sub
           .setName("voice-clear")

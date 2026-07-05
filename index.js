@@ -3741,20 +3741,24 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 client.on("messageCreate", async (msg) => {
-  if (msg.author.bot) return;
-  if (!msg.guild) return;
+  try {
+    if (msg.author.bot) return;
+    if (!msg.guild) return;
 
-  if (msg.mentions.users.has("495480158648795138")) {
-    msg.reply(getHizuMilitaryCountdownText());
-    return;
-  }
+    if (msg.mentions.users.has("495480158648795138")) {
+      msg.reply(getHizuMilitaryCountdownText());
+      return;
+    }
 
-  const c = msg.content.trim();
+    const c = msg.content.trim();
+
     const deprecatedMessage = getDeprecatedTextCommandMessage(c);
+
     if (deprecatedMessage) {
       msg.reply(deprecatedMessage);
       return;
     }
+
     const uid = msg.author.id;
     const now = Date.now();
 

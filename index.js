@@ -106,6 +106,34 @@ function formatTime(sec) {
   return `${h}小時${m}分${s}秒`;
 }
 
+function formatCountdown(ms) {
+  const safeMs = Math.max(0, Number(ms) || 0);
+  const totalSeconds = Math.floor(safeMs / 1000);
+
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  return `${days}天${hours}小時${minutes}分${seconds}秒`;
+}
+
+function getHizuMilitaryCountdownText() {
+  const now = new Date();
+
+  // 目標時間：台灣時間 2026/07/18 08:00
+  // JavaScript Date 的月份是 0 起算，所以 6 = 7月
+  const target = new Date(2026, 6, 18, 8, 0, 0);
+
+  const diffMs = target.getTime() - now.getTime();
+
+  if (diffMs <= 0) {
+    return "他已經出獄退伍了，恭喜重返人間 🫡";
+  }
+
+  return `他正在坐牢當兵 🫡\n距離 **7月18日 早上8點** 還剩：**${formatCountdown(diffMs)}**`;
+}
+
 function formatCoins(num) {
   return `${Number(num || 0).toLocaleString("zh-TW")}`;
 }
@@ -3713,11 +3741,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 client.on("messageCreate", async (msg) => {
-  try {
-    if (msg.author.bot) return;
-    if (!isAllowedChannel(msg.channel.id)) return;
+  if (msg.author.bot) return;
+  if (!msg.guild) return;
 
-    const c = msg.content.trim();
+  if (msg.mentions.users.has("495480158648795138")) {
+    msg.reply(getHizuMilitaryCountdownText());
+    return;
+  }
+
+  const c = msg.content.trim();
     const deprecatedMessage = getDeprecatedTextCommandMessage(c);
     if (deprecatedMessage) {
       msg.reply(deprecatedMessage);

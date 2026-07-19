@@ -48,6 +48,10 @@ const coinClearConfirmations = new Map();
 
 const VOICE_COIN_RATE_PER_HOUR = 100;
 
+const PLANT_GROW_TIMES = {
+  楊桃: 15 * 60 * 1000,
+};
+
 const pendingLoanApplications = new Map();
 const pendingRepayments = new Map();
 
@@ -104,6 +108,58 @@ function formatTime(sec) {
   const m = Math.floor((safeSec % 3600) / 60);
   const s = safeSec % 60;
   return `${h}小時${m}分${s}秒`;
+}
+
+function getPlantGrowTimeMs(plantName) {
+  const name = String(plantName || "").trim();
+  return PLANT_GROW_TIMES[name] || null;
+}
+
+function formatPlantGrowTime(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  return formatTime(totalSeconds);
+}
+
+async function handlePlanCommand(interaction) {
+  const plantName = interaction.options.getString("plant");
+  const growTimeMs = getPlantGrowTimeMs(plantName);
+
+  if (!growTimeMs) {
+    await interaction.reply({
+      content:
+        `目前還沒有支援「${plantName}」這個作物。\n` +
+        `目前支援：${Object.keys(PLANT_GROW_TIMES).join("、")}`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  const userId = interaction.user.id;
+  const channelId = interaction.channelId;
+  const harvestAt = Date.now() + growTimeMs;
+
+  await interaction.reply({
+    content:
+      `🌱 已開始計時：**${plantName}**\n` +
+      `成熟時間：**${formatPlantGrowTime(growTimeMs)}**\n` +
+      `時間到後我會在這個頻道提醒 <@${userId}> 採集。`,
+  });
+
+  setTimeout(async () => {
+    try {
+      const channel = await client.channels.fetch(channelId);
+
+      if (!channel || !channel.isTextBased()) return;
+
+      await channel.send({
+        content:
+          `🌾 <@${userId}> 你的 **${plantName}** 已經成熟了！\n` +
+          `該採集作物了。`,
+      });
+    } catch (error) {
+      console.error("作物提醒發送失敗：", error);
+    }
+  }, Math.max(1000, harvestAt - Date.now()));
 }
 
 function formatCoins(num) {
@@ -2106,6 +2162,18 @@ async function registerSlashCommands() {
 
   const commands = [
     new SlashCommandBuilder()
+      .setName("plan")
+      .setDescription("設定作物採集提醒")
+      .addStringOption((option) =>
+        option
+          .setName("plant")
+          .setDescription("植物名稱")
+          .setRequired(true)
+          .addChoices(
+            { name: "楊桃｜15分鐘", value: "楊桃" }
+          )
+      ),
+    new SlashCommandBuilder()
       .setName("wt")
       .setDescription("WorkTime Bot 指令")
       .addSubcommand((sub) =>
@@ -3281,6 +3349,11 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "plan") {
+        await handlePlanCommand(interaction);
+        return;
+      }
+
       if (interaction.inGuild() && !isAllowedChannel(interaction.channelId)) {
         await interaction.reply({
           content: "這個頻道不能使用此指令。",

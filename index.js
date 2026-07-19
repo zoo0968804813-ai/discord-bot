@@ -143,6 +143,7 @@ async function handlePlanCommand(interaction) {
       `🌱 已開始計時：**${plantName}**\n` +
       `成熟時間：**${formatPlantGrowTime(growTimeMs)}**\n` +
       `時間到後我會在這個頻道提醒 <@${userId}> 採集。`,
+      flags: MessageFlags.Ephemeral,
   });
 
   setTimeout(async () => {

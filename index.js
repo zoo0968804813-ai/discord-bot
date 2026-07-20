@@ -25,6 +25,13 @@ const {
   SeparatorSpacingSize,
 } = require("discord.js");
 
+const {
+  joinVoiceChannel,
+  getVoiceConnection,
+  VoiceConnectionStatus,
+  entersState,
+} = require("@discordjs/voice");
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   connectionTimeoutMillis: 10000,
@@ -41,6 +48,11 @@ const client = new Client({
 
 const workStartTimes = new Map();
 const voiceStartTimes = new Map();
+
+let voiceKeepHealthTimer = null;
+let voiceKeepReconnectTimer = null;
+let voiceKeepReconnectAttempts = 0;
+let voiceKeepManualLeave = false;
 
 const clearConfirmations = new Map();
 const moodResetConfirmations = new Map();
@@ -751,6 +763,236 @@ async function getVoiceRankingEmbed() {
   return embed;
 }
 
+async function joinKeepVoiceChannel(channelId, options = {}) {
+  const { save = true, reason = "manual" } = options;
+
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+
+  if (!channel || channel.type !== 2) {
+    throw new Error("找不到指定語音頻道，或該頻道不是語音頻道。");
+  }
+
+  voiceKeepManualLeave = false;
+
+  const existingConnection = getVoiceConnection(channel.guild.id);
+
+  if (existingConnection) {
+    existingConnection.destroy();
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: channel.id,
+    guildId: channel.guild.id,
+    adapterCreator: channel.guild.voiceAdapterCreator,
+    selfDeaf: true,
+    selfMute: false,
+  });
+
+  bindVoiceKeepConnectionEvents(connection, channel.id);
+
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    voiceKeepReconnectAttempts = 0;
+  } catch (error) {
+    console.error("Bot 加入語音頻道逾時：", error);
+  }
+
+  if (save) {
+    await setBotSetting("voice_keep_channel_id", channel.id);
+  }
+
+  console.log(
+    `語音保活已加入頻道：${channel.name} (${channel.id})，來源：${reason}`
+  );
+
+  return channel;
+}
+
+function bindVoiceKeepConnectionEvents(connection, channelId) {
+  connection.removeAllListeners(VoiceConnectionStatus.Disconnected);
+  connection.removeAllListeners(VoiceConnectionStatus.Destroyed);
+
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    if (voiceKeepManualLeave) return;
+
+    console.warn("語音保活連線中斷，準備嘗試恢復或重連。");
+
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+
+      console.log("語音保活連線正在恢復中。");
+    } catch {
+      scheduleVoiceKeepReconnect(channelId);
+    }
+  });
+
+  connection.on(VoiceConnectionStatus.Destroyed, async () => {
+    if (voiceKeepManualLeave) return;
+
+    console.warn("語音保活連線已被銷毀，準備重連。");
+    scheduleVoiceKeepReconnect(channelId);
+  });
+}
+
+function scheduleVoiceKeepReconnect(channelId) {
+  if (voiceKeepReconnectTimer) {
+    clearTimeout(voiceKeepReconnectTimer);
+  }
+
+  voiceKeepReconnectAttempts += 1;
+
+  const delayMs =
+    voiceKeepReconnectAttempts <= 1
+      ? 5_000
+      : voiceKeepReconnectAttempts === 2
+      ? 10_000
+      : 30_000;
+
+  voiceKeepReconnectTimer = setTimeout(async () => {
+    try {
+      const savedChannelId =
+        channelId || (await getBotSetting("voice_keep_channel_id"));
+
+      if (!savedChannelId || voiceKeepManualLeave) return;
+
+      await joinKeepVoiceChannel(savedChannelId, {
+        save: false,
+        reason: "auto-reconnect",
+      });
+    } catch (error) {
+      console.error("語音保活自動重連失敗：", error);
+      scheduleVoiceKeepReconnect(channelId);
+    }
+  }, delayMs);
+}
+
+async function leaveKeepVoiceChannel() {
+  voiceKeepManualLeave = true;
+
+  if (voiceKeepReconnectTimer) {
+    clearTimeout(voiceKeepReconnectTimer);
+    voiceKeepReconnectTimer = null;
+  }
+
+  const channelId = await getBotSetting("voice_keep_channel_id");
+  await clearBotSetting("voice_keep_channel_id");
+
+  if (!channelId) {
+    return {
+      ok: true,
+      text: "目前沒有設定語音保活頻道。",
+    };
+  }
+
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+
+  if (channel?.guild) {
+    const connection = getVoiceConnection(channel.guild.id);
+
+    if (connection) {
+      connection.destroy();
+    }
+  }
+
+  return {
+    ok: true,
+    text: "已停止語音保活，並讓 Bot 離開語音頻道。",
+  };
+}
+
+async function getVoiceKeepStatusText() {
+  const channelId = await getBotSetting("voice_keep_channel_id");
+
+  if (!channelId) {
+    return "目前語音保活狀態：未啟用";
+  }
+
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+
+  if (!channel) {
+    return [
+      "目前語音保活狀態：啟用中",
+      `目標語音頻道 ID：${channelId}`,
+      "目前連線狀態：找不到頻道，可能已被刪除或 Bot 沒有權限查看。",
+    ].join("\n");
+  }
+
+  const connection = getVoiceConnection(channel.guild.id);
+  const status = connection ? connection.state.status : "未連線";
+
+  return [
+    "目前語音保活狀態：啟用中",
+    `目標語音頻道：<#${channelId}>`,
+    `目前連線狀態：${status}`,
+    "自動重連：啟用",
+  ].join("\n");
+}
+
+function startVoiceKeepHealthCheck() {
+  if (voiceKeepHealthTimer) {
+    clearInterval(voiceKeepHealthTimer);
+  }
+
+  voiceKeepHealthTimer = setInterval(async () => {
+    try {
+      if (voiceKeepManualLeave) return;
+
+      const channelId = await getBotSetting("voice_keep_channel_id");
+      if (!channelId) return;
+
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (!channel || !channel.guild) return;
+
+      const connection = getVoiceConnection(channel.guild.id);
+
+      if (!connection) {
+        console.warn("語音保活健康檢查：連線不存在，重新加入。");
+
+        await joinKeepVoiceChannel(channelId, {
+          save: false,
+          reason: "health-check",
+        });
+
+        return;
+      }
+
+      if (
+        connection.state.status === VoiceConnectionStatus.Destroyed ||
+        connection.state.status === VoiceConnectionStatus.Disconnected
+      ) {
+        console.warn("語音保活健康檢查：狀態異常，重新加入。");
+
+        await joinKeepVoiceChannel(channelId, {
+          save: false,
+          reason: "health-check-status",
+        });
+      }
+    } catch (error) {
+      console.error("語音保活健康檢查失敗：", error);
+    }
+  }, 60 * 1000);
+}
+
+async function restoreVoiceKeepChannel() {
+  const channelId = await getBotSetting("voice_keep_channel_id");
+
+  if (!channelId) return;
+
+  try {
+    await joinKeepVoiceChannel(channelId, {
+      save: false,
+      reason: "startup-restore",
+    });
+
+    console.log("語音保活啟動恢復完成。");
+  } catch (error) {
+    console.error("語音保活啟動恢復失敗：", error);
+  }
+}
+
 function getWtHelpEmbed() {
   return new EmbedBuilder()
     .setTitle("📘 WorkTime Bot 使用說明")
@@ -1238,6 +1480,42 @@ async function setBankRates(minRate, maxRate) {
     DO UPDATE SET setting_value = $1
     `,
     [String(maxRate)]
+  );
+}
+
+async function setBotSetting(key, value) {
+  await pool.query(
+    `
+    INSERT INTO bot_settings (setting_key, setting_value)
+    VALUES ($1, $2)
+    ON CONFLICT (setting_key)
+    DO UPDATE SET setting_value = $2
+    `,
+    [key, String(value)]
+  );
+}
+
+async function getBotSetting(key) {
+  const result = await pool.query(
+    `
+    SELECT setting_value
+    FROM bot_settings
+    WHERE setting_key = $1
+    LIMIT 1
+    `,
+    [key]
+  );
+
+  return result.rows[0]?.setting_value || null;
+}
+
+async function clearBotSetting(key) {
+  await pool.query(
+    `
+    DELETE FROM bot_settings
+    WHERE setting_key = $1
+    `,
+    [key]
   );
 }
 
@@ -2149,6 +2427,74 @@ async function handleWtAdminCommand(interaction) {
     });
     return;
   }
+
+  if (sub === "voice-keep") {
+    const action = interaction.options.getString("action");
+
+    if (action === "join") {
+      const channel = interaction.options.getChannel("channel");
+
+      if (!channel) {
+        await interaction.reply({
+          content: "請選擇要加入並保活的語音頻道。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (channel.type !== 2) {
+        await interaction.reply({
+          content: "你選擇的不是語音頻道，請選擇一般語音頻道。",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      try {
+        await joinKeepVoiceChannel(channel.id, {
+          save: true,
+          reason: "slash-command",
+        });
+
+        await interaction.reply({
+          content:
+            `已加入 <#${channel.id}>，並啟用語音保活。\n` +
+            "如果 Bot 斷線，會自動嘗試重連；Bot 重啟後也會自動回到此頻道。",
+          flags: MessageFlags.Ephemeral,
+        });
+      } catch (error) {
+        console.error("啟用語音保活失敗：", error);
+
+        await interaction.reply({
+          content: `啟用語音保活失敗：${error.message}`,
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+
+      return;
+    }
+
+    if (action === "leave") {
+      const result = await leaveKeepVoiceChannel();
+
+      await interaction.reply({
+        content: result.text,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (action === "status") {
+      const text = await getVoiceKeepStatusText();
+
+      await interaction.reply({
+        content: text,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+  }
+
 }
 
 async function registerSlashCommands() {
@@ -2456,6 +2802,29 @@ async function registerSlashCommands() {
               .setName("user")
               .setDescription("指定用戶")
               .setRequired(true)
+          )
+      )
+
+      .addSubcommand((sub) =>
+        sub
+          .setName("voice-keep")
+          .setDescription("管理 Bot 語音保活")
+          .addStringOption((option) =>
+            option
+              .setName("action")
+              .setDescription("要執行的操作")
+              .setRequired(true)
+              .addChoices(
+                { name: "加入並啟用保活", value: "join" },
+                { name: "離開並停止保活", value: "leave" },
+                { name: "查詢保活狀態", value: "status" }
+              )
+          )
+          .addChannelOption((option) =>
+            option
+              .setName("channel")
+              .setDescription("要加入的語音頻道，action:join 時必填")
+              .setRequired(false)
           )
       ),
   ].map((command) => command.toJSON());
@@ -3237,6 +3606,13 @@ client.once(Events.ClientReady, async () => {
     `);
 
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS bot_settings (
+        setting_key TEXT PRIMARY KEY,
+        setting_value TEXT NOT NULL
+      );
+    `);
+
+    await pool.query(`
       INSERT INTO bank_settings (setting_key, setting_value)
       VALUES ('loan_min_rate', '0.5')
       ON CONFLICT (setting_key) DO NOTHING
@@ -3250,6 +3626,9 @@ client.once(Events.ClientReady, async () => {
 
     await loadActiveSessions();
     await loadActiveVoiceSessions();
+
+    await restoreVoiceKeepChannel();
+    startVoiceKeepHealthCheck();
 
     console.log("資料表確認完成");
 

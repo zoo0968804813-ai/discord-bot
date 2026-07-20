@@ -14,6 +14,7 @@ const {
   REST,
   Routes,
   SlashCommandBuilder,
+  ChannelType,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -2442,7 +2443,7 @@ async function handleWtAdminCommand(interaction) {
         return;
       }
 
-      if (channel.type !== 2) {
+      if (channel.type !== ChannelType.GuildVoice) {
         await interaction.reply({
           content: "你選擇的不是語音頻道，請選擇一般語音頻道。",
           flags: MessageFlags.Ephemeral,
@@ -2824,6 +2825,7 @@ async function registerSlashCommands() {
             option
               .setName("channel")
               .setDescription("要加入的語音頻道，action:join 時必填")
+              .addChannelTypes(ChannelType.GuildVoice)
               .setRequired(false)
           )
       ),

@@ -53,6 +53,7 @@ const voiceStartTimes = new Map();
 let voiceKeepHealthTimer = null;
 let voiceKeepReconnectTimer = null;
 let voiceKeepReconnectAttempts = 0;
+let voiceKeepReconnectTotal = 0;
 let voiceKeepManualLeave = false;
 
 const clearConfirmations = new Map();
@@ -764,12 +765,66 @@ async function getVoiceRankingEmbed() {
   return embed;
 }
 
+function getTaipeiDateTimeText(date = new Date()) {
+  return date.toLocaleString("zh-TW", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
+async function sendVoiceKeepLog(title, description, color = 0x66c5eb) {
+  try {
+    const logChannelId = process.env.VOICE_KEEP_LOG_CHANNEL_ID;
+
+    if (!logChannelId) {
+      console.log(`[語音保活Log] ${title}｜${description}`);
+      return;
+    }
+
+    const channel = await client.channels.fetch(logChannelId).catch(() => null);
+
+    if (!channel || !channel.isTextBased()) {
+      console.log(`[語音保活Log] 找不到Log頻道｜${title}｜${description}`);
+      return;
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle(title)
+      .setDescription(description)
+      .setColor(color)
+      .setFooter({
+        text: `Voice Keep Log｜台灣時間 ${getTaipeiDateTimeText()}`,
+      })
+      .setTimestamp();
+
+    await channel.send({ embeds: [embed] });
+  } catch (error) {
+    console.error("發送語音保活 Log 失敗：", error);
+  }
+}
+
 async function joinKeepVoiceChannel(channelId, options = {}) {
   const { save = true, reason = "manual" } = options;
 
   const channel = await client.channels.fetch(channelId).catch(() => null);
 
   if (!channel || channel.type !== 2) {
+    await sendVoiceKeepLog(
+      "❌ 語音保活加入失敗",
+      [
+        `原因：找不到指定語音頻道，或該頻道不是語音頻道。`,
+        `目標頻道 ID：${channelId}`,
+        `來源：${reason}`,
+      ].join("\n"),
+      0xe74c3c
+    );
+
     throw new Error("找不到指定語音頻道，或該頻道不是語音頻道。");
   }
 
@@ -779,7 +834,29 @@ async function joinKeepVoiceChannel(channelId, options = {}) {
 
   if (existingConnection) {
     existingConnection.destroy();
+
+    await sendVoiceKeepLog(
+      "♻️ 語音保活重新建立連線",
+      [
+        `目標語音頻道：<#${channel.id}>`,
+        `原因：已有舊連線，先銷毀後重新加入。`,
+        `來源：${reason}`,
+        `目前累計重連次數：${voiceKeepReconnectTotal}`,
+      ].join("\n"),
+      0xf1c40f
+    );
   }
+
+  await sendVoiceKeepLog(
+    "🔊 語音保活準備加入頻道",
+    [
+      `目標語音頻道：<#${channel.id}>`,
+      `伺服器：${channel.guild.name}`,
+      `來源：${reason}`,
+      `目前累計重連次數：${voiceKeepReconnectTotal}`,
+    ].join("\n"),
+    0x3498db
+  );
 
   const connection = joinVoiceChannel({
     channelId: channel.id,
@@ -794,8 +871,30 @@ async function joinKeepVoiceChannel(channelId, options = {}) {
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
     voiceKeepReconnectAttempts = 0;
+
+    await sendVoiceKeepLog(
+      "✅ 語音保活已成功加入",
+      [
+        `語音頻道：<#${channel.id}>`,
+        `來源：${reason}`,
+        `目前連線狀態：${connection.state.status}`,
+        `目前累計重連次數：${voiceKeepReconnectTotal}`,
+      ].join("\n"),
+      0x2ecc71
+    );
   } catch (error) {
     console.error("Bot 加入語音頻道逾時：", error);
+
+    await sendVoiceKeepLog(
+      "⚠️ 語音保活加入逾時",
+      [
+        `語音頻道：<#${channel.id}>`,
+        `來源：${reason}`,
+        `錯誤：${error.message}`,
+        `目前累計重連次數：${voiceKeepReconnectTotal}`,
+      ].join("\n"),
+      0xe67e22
+    );
   }
 
   if (save) {
@@ -812,11 +911,46 @@ async function joinKeepVoiceChannel(channelId, options = {}) {
 function bindVoiceKeepConnectionEvents(connection, channelId) {
   connection.removeAllListeners(VoiceConnectionStatus.Disconnected);
   connection.removeAllListeners(VoiceConnectionStatus.Destroyed);
+  connection.removeAllListeners(VoiceConnectionStatus.Ready);
+
+  connection.on(VoiceConnectionStatus.Ready, async () => {
+    await sendVoiceKeepLog(
+      "🟢 語音保活連線 Ready",
+      [
+        `語音頻道：<#${channelId}>`,
+        `目前狀態：${connection.state.status}`,
+        `目前累計重連次數：${voiceKeepReconnectTotal}`,
+      ].join("\n"),
+      0x2ecc71
+    );
+  });
 
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
-    if (voiceKeepManualLeave) return;
+    if (voiceKeepManualLeave) {
+      await sendVoiceKeepLog(
+        "🔇 語音保活已手動離開",
+        [
+          `語音頻道：<#${channelId}>`,
+          "原因：管理員執行 leave 或系統標記為手動離開。",
+          `目前累計重連次數：${voiceKeepReconnectTotal}`,
+        ].join("\n"),
+        0x95a5a6
+      );
+      return;
+    }
 
     console.warn("語音保活連線中斷，準備嘗試恢復或重連。");
+
+    await sendVoiceKeepLog(
+      "🟠 語音保活連線中斷",
+      [
+        `語音頻道：<#${channelId}>`,
+        "狀態：Disconnected",
+        "處理方式：先嘗試等待 Discord Voice Gateway 自行恢復。",
+        `目前累計重連次數：${voiceKeepReconnectTotal}`,
+      ].join("\n"),
+      0xe67e22
+    );
 
     try {
       await Promise.race([
@@ -824,8 +958,28 @@ function bindVoiceKeepConnectionEvents(connection, channelId) {
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
 
+      await sendVoiceKeepLog(
+        "🟡 語音保活連線恢復中",
+        [
+          `語音頻道：<#${channelId}>`,
+          `目前狀態：${connection.state.status}`,
+          `目前累計重連次數：${voiceKeepReconnectTotal}`,
+        ].join("\n"),
+        0xf1c40f
+      );
+
       console.log("語音保活連線正在恢復中。");
     } catch {
+      await sendVoiceKeepLog(
+        "🔁 語音保活準備排程重連",
+        [
+          `語音頻道：<#${channelId}>`,
+          "原因：等待恢復逾時，準備自動重連。",
+          `目前累計重連次數：${voiceKeepReconnectTotal}`,
+        ].join("\n"),
+        0xe67e22
+      );
+
       scheduleVoiceKeepReconnect(channelId);
     }
   });
@@ -834,6 +988,18 @@ function bindVoiceKeepConnectionEvents(connection, channelId) {
     if (voiceKeepManualLeave) return;
 
     console.warn("語音保活連線已被銷毀，準備重連。");
+
+    await sendVoiceKeepLog(
+      "🔴 語音保活連線被銷毀",
+      [
+        `語音頻道：<#${channelId}>`,
+        "狀態：Destroyed",
+        "處理方式：準備自動重連。",
+        `目前累計重連次數：${voiceKeepReconnectTotal}`,
+      ].join("\n"),
+      0xe74c3c
+    );
+
     scheduleVoiceKeepReconnect(channelId);
   });
 }
@@ -852,6 +1018,17 @@ function scheduleVoiceKeepReconnect(channelId) {
       ? 10_000
       : 30_000;
 
+  sendVoiceKeepLog(
+    "⏳ 語音保活重連已排程",
+    [
+      `目標語音頻道：<#${channelId}>`,
+      `本輪連續重連次數：${voiceKeepReconnectAttempts}`,
+      `累計重連次數：${voiceKeepReconnectTotal}`,
+      `預計 ${Math.floor(delayMs / 1000)} 秒後嘗試重連。`,
+    ].join("\n"),
+    0xf1c40f
+  );
+
   voiceKeepReconnectTimer = setTimeout(async () => {
     try {
       const savedChannelId =
@@ -859,12 +1036,36 @@ function scheduleVoiceKeepReconnect(channelId) {
 
       if (!savedChannelId || voiceKeepManualLeave) return;
 
+      voiceKeepReconnectTotal += 1;
+
+      await sendVoiceKeepLog(
+        "🔁 語音保活正在嘗試重連",
+        [
+          `目標語音頻道：<#${savedChannelId}>`,
+          `本輪連續重連次數：${voiceKeepReconnectAttempts}`,
+          `累計重連次數：${voiceKeepReconnectTotal}`,
+        ].join("\n"),
+        0x3498db
+      );
+
       await joinKeepVoiceChannel(savedChannelId, {
         save: false,
         reason: "auto-reconnect",
       });
     } catch (error) {
       console.error("語音保活自動重連失敗：", error);
+
+      await sendVoiceKeepLog(
+        "❌ 語音保活自動重連失敗",
+        [
+          `目標語音頻道：<#${channelId}>`,
+          `錯誤：${error.message}`,
+          `本輪連續重連次數：${voiceKeepReconnectAttempts}`,
+          `累計重連次數：${voiceKeepReconnectTotal}`,
+        ].join("\n"),
+        0xe74c3c
+      );
+
       scheduleVoiceKeepReconnect(channelId);
     }
   }, delayMs);
@@ -882,6 +1083,12 @@ async function leaveKeepVoiceChannel() {
   await clearBotSetting("voice_keep_channel_id");
 
   if (!channelId) {
+    await sendVoiceKeepLog(
+      "ℹ️ 語音保活停止操作",
+      "目前沒有設定語音保活頻道。",
+      0x95a5a6
+    );
+
     return {
       ok: true,
       text: "目前沒有設定語音保活頻道。",
@@ -898,6 +1105,17 @@ async function leaveKeepVoiceChannel() {
     }
   }
 
+  await sendVoiceKeepLog(
+    "🔇 語音保活已停止",
+    [
+      `原本目標語音頻道：<#${channelId}>`,
+      "已清除語音保活設定。",
+      "Bot 已嘗試離開語音頻道。",
+      `本次執行期間累計重連次數：${voiceKeepReconnectTotal}`,
+    ].join("\n"),
+    0x95a5a6
+  );
+
   return {
     ok: true,
     text: "已停止語音保活，並讓 Bot 離開語音頻道。",
@@ -908,7 +1126,10 @@ async function getVoiceKeepStatusText() {
   const channelId = await getBotSetting("voice_keep_channel_id");
 
   if (!channelId) {
-    return "目前語音保活狀態：未啟用";
+    return [
+      "目前語音保活狀態：未啟用",
+      `本次執行期間累計重連次數：${voiceKeepReconnectTotal}`,
+    ].join("\n");
   }
 
   const channel = await client.channels.fetch(channelId).catch(() => null);
@@ -918,6 +1139,8 @@ async function getVoiceKeepStatusText() {
       "目前語音保活狀態：啟用中",
       `目標語音頻道 ID：${channelId}`,
       "目前連線狀態：找不到頻道，可能已被刪除或 Bot 沒有權限查看。",
+      `本輪連續重連次數：${voiceKeepReconnectAttempts}`,
+      `本次執行期間累計重連次數：${voiceKeepReconnectTotal}`,
     ].join("\n");
   }
 
@@ -929,6 +1152,8 @@ async function getVoiceKeepStatusText() {
     `目標語音頻道：<#${channelId}>`,
     `目前連線狀態：${status}`,
     "自動重連：啟用",
+    `本輪連續重連次數：${voiceKeepReconnectAttempts}`,
+    `本次執行期間累計重連次數：${voiceKeepReconnectTotal}`,
   ].join("\n");
 }
 
@@ -952,6 +1177,18 @@ function startVoiceKeepHealthCheck() {
       if (!connection) {
         console.warn("語音保活健康檢查：連線不存在，重新加入。");
 
+        voiceKeepReconnectTotal += 1;
+
+        await sendVoiceKeepLog(
+          "🩺 語音保活健康檢查觸發重連",
+          [
+            `目標語音頻道：<#${channelId}>`,
+            "原因：健康檢查發現 VoiceConnection 不存在。",
+            `累計重連次數：${voiceKeepReconnectTotal}`,
+          ].join("\n"),
+          0xe67e22
+        );
+
         await joinKeepVoiceChannel(channelId, {
           save: false,
           reason: "health-check",
@@ -965,6 +1202,18 @@ function startVoiceKeepHealthCheck() {
         connection.state.status === VoiceConnectionStatus.Disconnected
       ) {
         console.warn("語音保活健康檢查：狀態異常，重新加入。");
+
+        voiceKeepReconnectTotal += 1;
+
+        await sendVoiceKeepLog(
+          "🩺 語音保活健康檢查觸發重連",
+          [
+            `目標語音頻道：<#${channelId}>`,
+            `原因：健康檢查發現狀態異常：${connection.state.status}`,
+            `累計重連次數：${voiceKeepReconnectTotal}`,
+          ].join("\n"),
+          0xe67e22
+        );
 
         await joinKeepVoiceChannel(channelId, {
           save: false,
@@ -980,9 +1229,25 @@ function startVoiceKeepHealthCheck() {
 async function restoreVoiceKeepChannel() {
   const channelId = await getBotSetting("voice_keep_channel_id");
 
-  if (!channelId) return;
+  if (!channelId) {
+    await sendVoiceKeepLog(
+      "ℹ️ 語音保活啟動檢查",
+      "目前沒有保存的語音保活頻道，不需要自動加入。",
+      0x95a5a6
+    );
+    return;
+  }
 
   try {
+    await sendVoiceKeepLog(
+      "🚀 語音保活啟動恢復",
+      [
+        `保存的語音頻道：<#${channelId}>`,
+        "Bot 啟動後準備自動回到語音頻道。",
+      ].join("\n"),
+      0x3498db
+    );
+
     await joinKeepVoiceChannel(channelId, {
       save: false,
       reason: "startup-restore",
@@ -991,6 +1256,15 @@ async function restoreVoiceKeepChannel() {
     console.log("語音保活啟動恢復完成。");
   } catch (error) {
     console.error("語音保活啟動恢復失敗：", error);
+
+    await sendVoiceKeepLog(
+      "❌ 語音保活啟動恢復失敗",
+      [
+        `保存的語音頻道：<#${channelId}>`,
+        `錯誤：${error.message}`,
+      ].join("\n"),
+      0xe74c3c
+    );
   }
 }
 

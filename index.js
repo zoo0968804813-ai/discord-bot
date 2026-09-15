@@ -3509,6 +3509,7 @@ async function endWork(userId, username) {
 }
 
 client.once(Events.ClientReady, async () => {
+  if (startupShutdownStarted) return;
   console.log(`BOT 已上線：${client.user.tag}`);
 
   try {
@@ -4541,25 +4542,42 @@ pool.on("error", (error) => {
   console.error("資料庫連線錯誤：", error);
 });
 
+let startupShutdownStarted = false;
+
 async function startBot() {
   if (!process.env.TOKEN) throw new Error("缺少 TOKEN 環境變數。");
   try {
     await client.login(process.env.TOKEN);
   } catch (error) {
     console.error("[Gateway login]", error);
-    // discord.js 14 的 login 失敗會 destroy client；讓 Railway 重建完整程序。
-    const transient = /50[234]|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|ECONNREFUSED/.test(String(error.message) + " " + String(error.code));
-    if (transient) {
-      console.warn("[Gateway login] 暫時連線失敗，等待 60 秒後結束，交由 Railway 重啟。");
-      await new Promise((resolve) => setTimeout(resolve, 60_000));
-    }
     throw error;
   }
 }
 
-startBot().catch(async (error) => {
+function stopAfterStartupFailure(error) {
+  if (startupShutdownStarted) return;
+  startupShutdownStarted = true;
   console.error("Bot 啟動失敗：", error);
-  await client.destroy();
-  await pool.end();
   process.exitCode = 1;
-});
+  const transient = /50[234]|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|ECONNREFUSED/.test(String(error.message) + " " + String(error.code));
+  const deadlineMs = transient ? 60_000 : 5_000;
+  console.warn(`[Gateway shutdown] 開始清理，${deadlineMs / 1000} 秒後退出；需由 Railway 失敗重啟策略重新啟動。`);
+  // 保留計時器：即使套件清理卡住或仍保有 socket，也會在期限退出。
+  setTimeout(() => process.exit(1), deadlineMs);
+  voiceKeepManualLeave = true;
+  cancelVoiceKeepTimer();
+  if (voiceKeepHealthTimer) clearInterval(voiceKeepHealthTimer);
+  if (rankingRewardTimer) clearInterval(rankingRewardTimer);
+  if (panelRefreshTimer) clearTimeout(panelRefreshTimer);
+  // 不等待清理才啟動期限，且個別清理失敗不妨礙另一項。
+  void Promise.allSettled([
+    Promise.resolve().then(() => client.destroy()),
+    Promise.resolve().then(() => pool.end()),
+  ]).then((results) => {
+    for (const result of results) {
+      if (result.status === "rejected") console.error("[Gateway shutdown] 清理失敗：", result.reason);
+    }
+  });
+}
+
+startBot().catch(stopAfterStartupFailure);

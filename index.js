@@ -52,15 +52,38 @@ client.on("shardError", (error, shardId) => console.error("[Gateway] shard=" + s
 client.on("warn", (warning) => console.warn("[Discord Warning]", warning));
 client.on("shardReconnecting", (shardId) => console.warn("[Gateway] reconnecting shard=" + shardId));
 client.on("shardDisconnect", (event, shardId) => console.warn("[Gateway] disconnected shard=" + shardId + " code=" + event.code));
+client.on("shardResume", (shardId, replayedEvents) => {
+  console.log(`[Gateway] resumed shard=${shardId} replayed=${replayedEvents}`);
+  ensureVoiceKeepConnection("Discord Gateway 已恢復");
+});
+client.on("shardReady", (shardId) => {
+  console.log(`[Gateway] ready shard=${shardId}`);
+  ensureVoiceKeepConnection("Discord Gateway 已就緒");
+});
 
 const workStartTimes = new Map();
 const voiceStartTimes = new Map();
+const voiceSessionOperations = new Map();
 
 let voiceKeepHealthTimer = null;
 let voiceKeepReconnectTimer = null;
+let voiceKeepStableTimer = null;
 let voiceKeepReconnectAttempts = 0;
 let voiceKeepReconnectTotal = 0;
 let voiceKeepManualLeave = false;
+let voiceKeepLastReadyAt = null;
+let voiceKeepLastStateChangeAt = null;
+
+let voiceSessionMaintenanceTimer = null;
+let voiceSessionMaintenanceBusy = false;
+let voiceRuntimeLastDiagnosticAt = 0;
+
+const VOICE_SESSION_MAINTENANCE_INTERVAL_MS = 60 * 1000;
+const VOICE_SESSION_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000;
+const VOICE_STALE_SESSION_GRACE_MS = 2 * 60 * 1000;
+const VOICE_RUNTIME_HEARTBEAT_KEY = "voice_runtime_heartbeat_at";
+const VOICE_KEEP_STABLE_RESET_MS = 5 * 60 * 1000;
+const VOICE_KEEP_STUCK_TIMEOUT_MS = 90 * 1000;
 
 const clearConfirmations = new Map();
 const moodResetConfirmations = new Map();
@@ -244,33 +267,6 @@ function isAllowedChannel(id) {
 
 function isAdmin(member) {
   return member.permissions.has(PermissionsBitField.Flags.Administrator);
-}
-
-function isQuestion(t) {
-  return (
-    /[?？嗎嘛呢喔欸了诶ㄛㄟ]$/.test(t) ||
-    t.includes("幾點") ||
-    t.includes("沒有") ||
-    t.includes("是否") ||
-    t.includes("什麼時候")
-  );
-}
-
-function isOther(t) {
-  return (
-    t.includes("你") ||
-    t.includes("他") ||
-    t.includes("她") ||
-    t.includes("有人")
-  );
-}
-
-function isStart(t) {
-  return t.includes("上班") && !isQuestion(t) && !isOther(t);
-}
-
-function isEnd(t) {
-  return t.includes("下班") && !isQuestion(t) && !isOther(t);
 }
 
 function pad2(num) {
@@ -649,17 +645,6 @@ async function saveActiveVoiceSession(userId, username, channelId, startTime) {
   );
 }
 
-async function updateActiveVoiceChannel(userId, channelId) {
-  await pool.query(
-    `
-    UPDATE active_voice_sessions
-    SET channel_id = $1
-    WHERE user_id = $2
-    `,
-    [channelId, userId]
-  );
-}
-
 async function removeActiveVoiceSession(userId) {
   await pool.query(
     `
@@ -689,31 +674,294 @@ async function loadActiveVoiceSessions() {
   console.log(`已恢復 ${result.rows.length} 位語音在線中的打工人`);
 }
 
-async function addVoiceTimeAndReward(userId, username, voiceSeconds) {
-  const safeSeconds = Math.max(0, Number(voiceSeconds) || 0);
-  const earnedCoins = Math.floor(
-    (safeSeconds / 3600) * VOICE_COIN_RATE_PER_HOUR
-  );
+function getCurrentHumanVoiceMembers() {
+  const members = new Map();
+  const configuredGuild = process.env.GUILD_ID
+    ? client.guilds.cache.get(process.env.GUILD_ID)
+    : null;
+  const guilds = configuredGuild
+    ? [configuredGuild]
+    : Array.from(client.guilds.cache.values());
 
-  await pool.query(
-    `
-    INSERT INTO voice_totals (user_id, username, total_seconds, coins, updated_at)
-    VALUES ($1, $2, $3, $4, $5)
-    ON CONFLICT (user_id)
-    DO UPDATE SET
-      total_seconds = voice_totals.total_seconds + $3,
-      coins = voice_totals.coins + $4,
-      username = $2,
-      updated_at = $5
-    `,
-    [userId, username, safeSeconds, earnedCoins, Date.now()]
-  );
+  for (const guild of guilds) {
+    for (const voiceState of guild.voiceStates.cache.values()) {
+      const member = voiceState.member;
 
-  if (earnedCoins > 0) {
-    await addCoins(userId, username, earnedCoins);
+      if (!voiceState.channelId || !member || member.user.bot) continue;
+
+      members.set(member.id, {
+        username: member.user.username,
+        channelId: voiceState.channelId,
+      });
+    }
   }
 
-  return earnedCoins;
+  return members;
+}
+
+async function reconcileVoiceSessions(options = {}) {
+  const {
+    checkpointActive = false,
+    startup = false,
+    previousHeartbeat = null,
+  } = options;
+  const now = Date.now();
+  const currentMembers = getCurrentHumanVoiceMembers();
+  const userIds = new Set([
+    ...voiceStartTimes.keys(),
+    ...currentMembers.keys(),
+  ]);
+
+  for (const userId of userIds) {
+    await runVoiceSessionOperation(userId, async () => {
+      // 進入每位使用者的序列化工作後重新讀取 Cache，避免和剛發生的
+      // VoiceStateUpdate 競速而建立已離線的幽靈 Session。
+      const current = getCurrentHumanVoiceMembers().get(userId);
+      const session = voiceStartTimes.get(userId);
+
+      if (current) {
+        if (!session) {
+          const newSession = {
+            username: current.username,
+            channelId: current.channelId,
+            startTime: now,
+          };
+
+          voiceStartTimes.set(userId, newSession);
+          await saveActiveVoiceSession(
+            userId,
+            current.username,
+            current.channelId,
+            now
+          );
+          return;
+        }
+
+        session.username = current.username;
+        session.channelId = current.channelId;
+
+        if (
+          checkpointActive &&
+          now - Number(session.startTime) >= VOICE_SESSION_CHECKPOINT_INTERVAL_MS
+        ) {
+          const result = await commitVoiceSegment(
+            userId,
+            current.username,
+            session,
+            now,
+            true
+          );
+
+          session.startTime = result.checkpointTime;
+          voiceStartTimes.set(userId, session);
+        } else {
+          voiceStartTimes.set(userId, session);
+          await saveActiveVoiceSession(
+            userId,
+            current.username,
+            current.channelId,
+            session.startTime
+          );
+        }
+
+        return;
+      }
+
+      if (!session) return;
+
+      if (startup) {
+        const heartbeat = Number(previousHeartbeat);
+
+        if (Number.isFinite(heartbeat) && heartbeat >= Number(session.startTime)) {
+          const recoveryEndTime = Math.min(
+            now,
+            heartbeat + VOICE_STALE_SESSION_GRACE_MS
+          );
+          await commitVoiceSegment(
+            userId,
+            session.username,
+            session,
+            recoveryEndTime,
+            false
+          );
+        } else {
+          await removeActiveVoiceSession(userId);
+        }
+      } else {
+        await commitVoiceSegment(
+          userId,
+          session.username,
+          session,
+          now,
+          false
+        );
+      }
+
+      voiceStartTimes.delete(userId);
+    });
+  }
+}
+
+async function runVoiceSessionMaintenance() {
+  if (voiceSessionMaintenanceBusy || !client.isReady()) return;
+
+  voiceSessionMaintenanceBusy = true;
+
+  try {
+    await setBotSetting(VOICE_RUNTIME_HEARTBEAT_KEY, Date.now());
+    await reconcileVoiceSessions({ checkpointActive: true });
+
+    if (Date.now() - voiceRuntimeLastDiagnosticAt >= 6 * 60 * 60 * 1000) {
+      voiceRuntimeLastDiagnosticAt = Date.now();
+      const memory = process.memoryUsage();
+      console.log(
+        `[Voice Runtime] uptime=${formatTime(Math.floor(process.uptime()))} ` +
+          `rss=${Math.round(memory.rss / 1024 / 1024)}MB ` +
+          `heap=${Math.round(memory.heapUsed / 1024 / 1024)}MB ` +
+          `activeSessions=${voiceStartTimes.size} queuedOps=${voiceSessionOperations.size}`
+      );
+    }
+  } catch (error) {
+    console.error("語音在線維護失敗：", error);
+  } finally {
+    voiceSessionMaintenanceBusy = false;
+  }
+}
+
+async function startVoiceSessionMaintenance(previousHeartbeat) {
+  if (voiceSessionMaintenanceTimer) {
+    clearInterval(voiceSessionMaintenanceTimer);
+  }
+
+  await reconcileVoiceSessions({
+    checkpointActive: true,
+    startup: true,
+    previousHeartbeat,
+  });
+  await setBotSetting(VOICE_RUNTIME_HEARTBEAT_KEY, Date.now());
+
+  voiceSessionMaintenanceTimer = setInterval(() => {
+    void runVoiceSessionMaintenance();
+  }, VOICE_SESSION_MAINTENANCE_INTERVAL_MS);
+}
+
+async function runVoiceSessionOperation(userId, operation) {
+  const previous = voiceSessionOperations.get(userId) || Promise.resolve();
+  const current = previous.catch(() => {}).then(operation);
+
+  voiceSessionOperations.set(userId, current);
+
+  try {
+    return await current;
+  } finally {
+    if (voiceSessionOperations.get(userId) === current) {
+      voiceSessionOperations.delete(userId);
+    }
+  }
+}
+
+async function commitVoiceSegment(
+  userId,
+  username,
+  session,
+  endTime,
+  keepActive
+) {
+  const safeEndTime = Math.max(Number(session.startTime) || 0, Number(endTime) || 0);
+  const voiceSeconds = Math.max(
+    0,
+    Math.floor((safeEndTime - Number(session.startTime || 0)) / 1000)
+  );
+  const db = await pool.connect();
+
+  try {
+    await db.query("BEGIN");
+
+    await db.query(
+      `
+      INSERT INTO voice_totals (user_id, username, total_seconds, coins, updated_at)
+      VALUES ($1, $2, 0, 0, $3)
+      ON CONFLICT (user_id) DO NOTHING
+      `,
+      [userId, username, safeEndTime]
+    );
+
+    const totalResult = await db.query(
+      `
+      SELECT total_seconds
+      FROM voice_totals
+      WHERE user_id = $1
+      FOR UPDATE
+      `,
+      [userId]
+    );
+
+    const previousTotalSeconds = Number(totalResult.rows[0]?.total_seconds) || 0;
+    const nextTotalSeconds = previousTotalSeconds + voiceSeconds;
+    const previousRewardTotal = Math.floor(
+      (previousTotalSeconds / 3600) * VOICE_COIN_RATE_PER_HOUR
+    );
+    const nextRewardTotal = Math.floor(
+      (nextTotalSeconds / 3600) * VOICE_COIN_RATE_PER_HOUR
+    );
+    const earnedCoins = Math.max(0, nextRewardTotal - previousRewardTotal);
+
+    await db.query(
+      `
+      UPDATE voice_totals
+      SET
+        total_seconds = total_seconds + $1,
+        coins = coins + $2,
+        username = $3,
+        updated_at = $4
+      WHERE user_id = $5
+      `,
+      [voiceSeconds, earnedCoins, username, safeEndTime, userId]
+    );
+
+    if (earnedCoins > 0) {
+      await db.query(
+        `
+        INSERT INTO work_totals (user_id, username, total_seconds, mood_score, coins)
+        VALUES ($1, $2, 0, 0, $3)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+          coins = work_totals.coins + $3,
+          username = $2
+        `,
+        [userId, username, earnedCoins]
+      );
+    }
+
+    if (keepActive) {
+      await db.query(
+        `
+        INSERT INTO active_voice_sessions (user_id, username, channel_id, start_time)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+          username = $2,
+          channel_id = $3,
+          start_time = $4
+        `,
+        [userId, username, session.channelId, safeEndTime]
+      );
+    } else {
+      await db.query(
+        `DELETE FROM active_voice_sessions WHERE user_id = $1`,
+        [userId]
+      );
+    }
+
+    await db.query("COMMIT");
+
+    return { voiceSeconds, earnedCoins, checkpointTime: safeEndTime };
+  } catch (error) {
+    await db.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    db.release();
+  }
 }
 
 async function getVoiceRankingEmbed() {
@@ -822,16 +1070,80 @@ let voiceKeepConnection = null;
 let voiceKeepOperation = Promise.resolve();
 let voiceKeepStopping = false;
 const voiceKeepIgnored = new WeakSet();
+const voiceKeepBoundConnections = new WeakSet();
+
+function getErrorText(error) {
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message}${error.code ? ` (${error.code})` : ""}`;
+  }
+
+  return String(error);
+}
+
+function isTransientVoiceError(error) {
+  const text = getErrorText(error);
+
+  return /Unexpected server response:\s*5\d\d|WebSocket.*closed|socket.*closed|IP discovery|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|UND_ERR|voice connection|voice websocket|udp/i.test(
+    text
+  );
+}
 
 function cancelVoiceKeepTimer() {
   if (voiceKeepReconnectTimer) clearTimeout(voiceKeepReconnectTimer);
   voiceKeepReconnectTimer = null;
 }
 
+function cancelVoiceKeepStableTimer() {
+  if (voiceKeepStableTimer) clearTimeout(voiceKeepStableTimer);
+  voiceKeepStableTimer = null;
+}
+
 function destroyKeepConnection(connection) {
   if (!connection) return;
   voiceKeepIgnored.add(connection);
   if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+}
+
+function requestVoiceKeepRecovery(reason, error = null) {
+  if (
+    voiceKeepManualLeave ||
+    voiceKeepStopping ||
+    !voiceKeepTarget
+  ) {
+    return;
+  }
+
+  const detail = error ? `\n${getErrorText(error)}` : "";
+  console.warn(`[Voice Keep] recovery requested: ${reason}${detail}`);
+  cancelVoiceKeepStableTimer();
+
+  if (voiceKeepConnection) {
+    destroyKeepConnection(voiceKeepConnection);
+    voiceKeepConnection = null;
+  }
+
+  void sendVoiceKeepLog(
+    "🛠️ 語音保活啟動自我修復",
+    `原因：${reason}${detail}`,
+    0xe67e22
+  );
+
+  scheduleVoiceKeepReconnect(voiceKeepTarget);
+}
+
+function ensureVoiceKeepConnection(reason) {
+  if (voiceKeepManualLeave || voiceKeepStopping || !voiceKeepTarget) return;
+
+  const connection = voiceKeepConnection;
+
+  if (
+    connection?.state.status === VoiceConnectionStatus.Ready &&
+    connection.joinConfig.channelId === voiceKeepTarget
+  ) {
+    return;
+  }
+
+  requestVoiceKeepRecovery(reason);
 }
 
 function joinKeepVoiceChannel(channelId, options = {}) {
@@ -871,7 +1183,14 @@ async function performKeepJoin(channelId, options, generation) {
   cancelVoiceKeepTimer();
   const existing = getVoiceConnection(channel.guild.id);
   if (existing?.state.status === VoiceConnectionStatus.Ready &&
-      existing.joinConfig.channelId === channel.id) return channel;
+      existing.joinConfig.channelId === channel.id) {
+    voiceKeepConnection = existing;
+    bindVoiceKeepConnectionEvents(existing, channel.id);
+    voiceKeepLastReadyAt = Date.now();
+    voiceKeepLastStateChangeAt = voiceKeepLastReadyAt;
+    return channel;
+  }
+  cancelVoiceKeepStableTimer();
   destroyKeepConnection(voiceKeepConnection);
   if (existing !== voiceKeepConnection) destroyKeepConnection(existing);
   if (reason === "auto-reconnect") voiceKeepReconnectTotal += 1;
@@ -885,47 +1204,70 @@ async function performKeepJoin(channelId, options, generation) {
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
     checkCancelled();
-    voiceKeepReconnectAttempts = 0;
     return channel;
   } catch (error) {
     destroyKeepConnection(connection);
-    void sendVoiceKeepLog("❌ 語音保活加入失敗", `頻道：<#${channel.id}>\n${error.message}`, 0xe74c3c);
+    if (voiceKeepConnection === connection) voiceKeepConnection = null;
+    void sendVoiceKeepLog("❌ 語音保活加入失敗", `頻道：<#${channel.id}>\n${getErrorText(error)}`, 0xe74c3c);
     throw error;
   }
 }
 
 function bindVoiceKeepConnectionEvents(connection, channelId) {
+  if (voiceKeepBoundConnections.has(connection)) return;
+  voiceKeepBoundConnections.add(connection);
+
   const active = () => !voiceKeepManualLeave && !voiceKeepIgnored.has(connection) &&
     voiceKeepConnection === connection && voiceKeepTarget === channelId;
   let recovering = false;
+
+  connection.on("stateChange", (_oldState, newState) => {
+    if (!active()) return;
+    voiceKeepLastStateChangeAt = Date.now();
+
+    if (newState.status !== VoiceConnectionStatus.Ready) {
+      cancelVoiceKeepStableTimer();
+    }
+  });
+
   connection.on("error", (error) => {
     console.error(`[Voice WebSocket] channel=${channelId}`, error);
     if (!active()) return;
-    void sendVoiceKeepLog("❌ 語音連線錯誤", `頻道：<#${channelId}>\n${error.message}`, 0xe74c3c);
-    destroyKeepConnection(connection);
-    scheduleVoiceKeepReconnect(channelId);
+    requestVoiceKeepRecovery("語音連線錯誤", error);
   });
+
   connection.on(VoiceConnectionStatus.Ready, () => {
     if (!active()) return;
-    voiceKeepReconnectAttempts = 0;
+    voiceKeepLastReadyAt = Date.now();
+    voiceKeepLastStateChangeAt = voiceKeepLastReadyAt;
     cancelVoiceKeepTimer();
+    cancelVoiceKeepStableTimer();
+    voiceKeepStableTimer = setTimeout(() => {
+      if (active() && connection.state.status === VoiceConnectionStatus.Ready) {
+        voiceKeepReconnectAttempts = 0;
+      }
+    }, VOICE_KEEP_STABLE_RESET_MS);
     void sendVoiceKeepLog("✅ 語音保活連線就緒", `頻道：<#${channelId}>\n累計重連：${voiceKeepReconnectTotal}`, 0x2ecc71);
   });
+
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
     if (!active() || recovering) return;
     recovering = true;
     void sendVoiceKeepLog("🟠 語音連線中斷", `頻道：<#${channelId}>\n等待自動恢復。`, 0xe67e22);
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-    } catch {
+    } catch (error) {
       if (active()) {
-        destroyKeepConnection(connection);
-        scheduleVoiceKeepReconnect(channelId);
+        requestVoiceKeepRecovery("語音中斷後 20 秒內未自動恢復", error);
       }
     } finally { recovering = false; }
   });
+
   connection.on(VoiceConnectionStatus.Destroyed, () => {
-    if (active()) scheduleVoiceKeepReconnect(channelId);
+    if (active()) {
+      voiceKeepConnection = null;
+      scheduleVoiceKeepReconnect(channelId);
+    }
   });
 }
 
@@ -933,7 +1275,12 @@ function scheduleVoiceKeepReconnect(channelId) {
   if (!channelId || channelId !== voiceKeepTarget || voiceKeepManualLeave ||
       voiceKeepStopping || voiceKeepBusy || voiceKeepReconnectTimer) return;
   const generation = voiceKeepGeneration;
-  const delayMs = Math.min(300_000, 5_000 * 2 ** Math.min(voiceKeepReconnectAttempts, 6));
+  const baseDelayMs = Math.min(
+    300_000,
+    5_000 * 2 ** Math.min(voiceKeepReconnectAttempts, 6)
+  );
+  const jitter = 0.8 + Math.random() * 0.4;
+  const delayMs = Math.min(300_000, Math.round(baseDelayMs * jitter));
   voiceKeepReconnectAttempts += 1;
   void sendVoiceKeepLog("⏳ 語音重連已排程", `頻道：<#${channelId}>\n${delayMs / 1000} 秒後重試。`);
   voiceKeepReconnectTimer = setTimeout(async () => {
@@ -955,6 +1302,7 @@ async function leaveKeepVoiceChannel() {
   voiceKeepManualLeave = true;
   voiceKeepGeneration += 1;
   cancelVoiceKeepTimer();
+  cancelVoiceKeepStableTimer();
   destroyKeepConnection(voiceKeepConnection);
   try {
     // 等待進行中的保存完成，才刪除設定，避免 leave 後舊操作又寫回。
@@ -964,6 +1312,8 @@ async function leaveKeepVoiceChannel() {
     voiceKeepTarget = null;
     voiceKeepConnection = null;
     voiceKeepReconnectAttempts = 0;
+    voiceKeepLastReadyAt = null;
+    voiceKeepLastStateChangeAt = null;
     void sendVoiceKeepLog("🔇 語音保活已停止", `本次執行累計重連：${voiceKeepReconnectTotal}`);
     return { ok: true, text: "已停止語音保活，並離開語音頻道。" };
   } finally { voiceKeepStopping = false; }
@@ -971,11 +1321,20 @@ async function leaveKeepVoiceChannel() {
 
 async function getVoiceKeepStatusText() {
   const channelId = await getBotSetting("voice_keep_channel_id");
+  const memory = process.memoryUsage();
+  const runtimeLines = [
+    `程序持續執行時間：${formatTime(Math.floor(process.uptime()))}`,
+    `記憶體：RSS ${Math.round(memory.rss / 1024 / 1024)} MB／Heap ${Math.round(
+      memory.heapUsed / 1024 / 1024
+    )} MB`,
+    `語音計時中人數：${voiceStartTimes.size}`,
+  ];
 
   if (!channelId) {
     return [
       "目前語音保活狀態：未啟用",
       `本次執行期間累計重連次數：${voiceKeepReconnectTotal}`,
+      ...runtimeLines,
     ].join("\n");
   }
 
@@ -988,6 +1347,7 @@ async function getVoiceKeepStatusText() {
       "目前連線狀態：找不到頻道，可能已被刪除或 Bot 沒有權限查看。",
       `本輪連續重連次數：${voiceKeepReconnectAttempts}`,
       `本次執行期間累計重連次數：${voiceKeepReconnectTotal}`,
+      ...runtimeLines,
     ].join("\n");
   }
 
@@ -1001,6 +1361,12 @@ async function getVoiceKeepStatusText() {
     "自動重連：啟用",
     `本輪連續重連次數：${voiceKeepReconnectAttempts}`,
     `本次執行期間累計重連次數：${voiceKeepReconnectTotal}`,
+    `最近一次連線就緒：${
+      voiceKeepLastReadyAt
+        ? getTaipeiDateTimeText(new Date(voiceKeepLastReadyAt))
+        : "本次執行尚無紀錄"
+    }`,
+    ...runtimeLines,
   ].join("\n");
 }
 
@@ -1008,10 +1374,31 @@ function startVoiceKeepHealthCheck() {
   if (voiceKeepHealthTimer) clearInterval(voiceKeepHealthTimer);
   voiceKeepHealthTimer = setInterval(() => {
     if (voiceKeepManualLeave || voiceKeepBusy || !voiceKeepTarget) return;
-    if (voiceKeepConnection?.state.status !== VoiceConnectionStatus.Ready) {
+
+    const connection = voiceKeepConnection;
+
+    if (connection?.state.status === VoiceConnectionStatus.Ready) {
+      const guild = client.guilds.cache.get(connection.joinConfig.guildId);
+      const actualChannelId = guild?.members.me?.voice?.channelId || null;
+
+      if (
+        connection.joinConfig.channelId !== voiceKeepTarget ||
+        actualChannelId !== voiceKeepTarget
+      ) {
+        requestVoiceKeepRecovery("健康檢查發現 Bot 不在指定語音頻道");
+      }
+
+      return;
+    }
+
+    const stateAge = Date.now() - Number(voiceKeepLastStateChangeAt || 0);
+
+    if (stateAge >= VOICE_KEEP_STUCK_TIMEOUT_MS) {
+      requestVoiceKeepRecovery("語音連線長時間未進入 Ready 狀態");
+    } else {
       scheduleVoiceKeepReconnect(voiceKeepTarget);
     }
-  }, 60_000);
+  }, 30_000);
 }
 
 async function restoreVoiceKeepChannel() {
@@ -1050,10 +1437,6 @@ function getWtHelpEmbed() {
         "進入語音頻道會累積語音在線時間。",
         `每在線 1 小時可獲得 🪙 ${VOICE_COIN_RATE_PER_HOUR} 金幣。`,
         "語音時間不會加入打工總工時排行榜。",
-        "",
-        "## 💬 自然語句",
-        "你仍然可以直接輸入：",
-        "`上班`、`下班`",
       ].join("\n")
     )
     .setFooter({ text: "WorkTime Bot Help" })
@@ -2451,8 +2834,10 @@ async function handleWtAdminCommand(interaction) {
   if (sub === "voice-clear") {
     const user = interaction.options.getUser("user");
 
-    voiceStartTimes.delete(user.id);
-    await removeActiveVoiceSession(user.id);
+    await runVoiceSessionOperation(user.id, async () => {
+      voiceStartTimes.delete(user.id);
+      await removeActiveVoiceSession(user.id);
+    });
 
     await interaction.reply({
       content: `已清除 ${user.username} 目前進行中的語音在線暫存紀錄。永久語音累積紀錄不受影響。`,
@@ -3658,8 +4043,13 @@ client.once(Events.ClientReady, async () => {
       ON CONFLICT (setting_key) DO NOTHING
     `);
 
+    const previousVoiceRuntimeHeartbeat = await getBotSetting(
+      VOICE_RUNTIME_HEARTBEAT_KEY
+    );
+
     await loadActiveSessions();
     await loadActiveVoiceSessions();
+    await startVoiceSessionMaintenance(previousVoiceRuntimeHeartbeat);
 
     await restoreVoiceKeepChannel();
     startVoiceKeepHealthCheck();
@@ -3679,82 +4069,95 @@ client.once(Events.ClientReady, async () => {
 });
 
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  const member = newState.member || oldState.member;
+  if (!member || member.user.bot) return;
+
+  const userId = member.user.id;
+
   try {
-    const member = newState.member || oldState.member;
-    if (!member || member.user.bot) return;
+    await runVoiceSessionOperation(userId, async () => {
+      const username = member.user.username;
+      const oldChannelId = oldState.channelId;
+      const newChannelId = newState.channelId;
 
-    const userId = member.user.id;
-    const username = member.user.username;
+      // 進入語音頻道
+      if (!oldChannelId && newChannelId) {
+        const existingSession = voiceStartTimes.get(userId);
 
-    const oldChannelId = oldState.channelId;
-    const newChannelId = newState.channelId;
+        if (existingSession) {
+          existingSession.username = username;
+          existingSession.channelId = newChannelId;
+          voiceStartTimes.set(userId, existingSession);
+          await saveActiveVoiceSession(
+            userId,
+            username,
+            newChannelId,
+            existingSession.startTime
+          );
+        } else {
+          const startTime = Date.now();
+          const session = { username, channelId: newChannelId, startTime };
 
-    // 進入語音頻道
-    if (!oldChannelId && newChannelId) {
-      const startTime = Date.now();
+          voiceStartTimes.set(userId, session);
+          await saveActiveVoiceSession(userId, username, newChannelId, startTime);
+        }
 
-      voiceStartTimes.set(userId, {
-        username,
-        channelId: newChannelId,
-        startTime,
-      });
-
-      await saveActiveVoiceSession(userId, username, newChannelId, startTime);
-
-      console.log(`${username} 進入語音頻道，開始累積語音在線時間。`);
-      return;
-    }
-
-    // 離開語音頻道
-    if (oldChannelId && !newChannelId) {
-      const session = voiceStartTimes.get(userId);
-
-      if (!session) {
-        await removeActiveVoiceSession(userId);
+        console.log(`${username} 進入語音頻道，開始累積語音在線時間。`);
         return;
       }
 
-      const voiceSeconds = Math.floor((Date.now() - session.startTime) / 1000);
-      const earnedCoins = await addVoiceTimeAndReward(
-        userId,
-        username,
-        voiceSeconds
-      );
+      // 離開語音頻道
+      if (oldChannelId && !newChannelId) {
+        const session = voiceStartTimes.get(userId);
 
-      voiceStartTimes.delete(userId);
-      await removeActiveVoiceSession(userId);
+        if (!session) {
+          await removeActiveVoiceSession(userId);
+          return;
+        }
 
-      console.log(
-        `${username} 離開語音頻道，本次在線 ${formatTime(
-          voiceSeconds
-        )}，獲得 ${earnedCoins} 金幣。`
-      );
-
-      return;
-    }
-
-    // 切換語音頻道，不重置時間，只更新 channel_id
-    if (oldChannelId && newChannelId && oldChannelId !== newChannelId) {
-      const session = voiceStartTimes.get(userId);
-
-      if (session) {
-        session.channelId = newChannelId;
-        voiceStartTimes.set(userId, session);
-        await updateActiveVoiceChannel(userId, newChannelId);
-      } else {
-        const startTime = Date.now();
-
-        voiceStartTimes.set(userId, {
+        const result = await commitVoiceSegment(
+          userId,
           username,
-          channelId: newChannelId,
-          startTime,
-        });
+          session,
+          Date.now(),
+          false
+        );
 
-        await saveActiveVoiceSession(userId, username, newChannelId, startTime);
+        voiceStartTimes.delete(userId);
+
+        console.log(
+          `${username} 離開語音頻道，本次結算 ${formatTime(
+            result.voiceSeconds
+          )}，獲得 ${result.earnedCoins} 金幣。`
+        );
+        return;
       }
 
-      console.log(`${username} 切換語音頻道，語音在線時間繼續累積。`);
-    }
+      // 切換語音頻道，不重置時間，只更新 channel_id
+      if (oldChannelId && newChannelId && oldChannelId !== newChannelId) {
+        const session = voiceStartTimes.get(userId);
+
+        if (session) {
+          session.username = username;
+          session.channelId = newChannelId;
+          voiceStartTimes.set(userId, session);
+          await saveActiveVoiceSession(
+            userId,
+            username,
+            newChannelId,
+            session.startTime
+          );
+        } else {
+          const startTime = Date.now();
+          const newSession = { username, channelId: newChannelId, startTime };
+
+          voiceStartTimes.set(userId, newSession);
+          await saveActiveVoiceSession(userId, username, newChannelId, startTime);
+        }
+
+        console.log(`${username} 切換語音頻道，語音在線時間繼續累積。`);
+      }
+    });
   } catch (error) {
     console.error("處理語音狀態更新時發生錯誤：", error);
   }
@@ -4201,343 +4604,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 client.on("messageCreate", async (msg) => {
   try {
-    if (msg.author.bot) return;
-    if (!msg.guild) return;
+    if (msg.author.bot || !msg.guild) return;
 
-    const c = msg.content.trim();
-
-    const deprecatedMessage = getDeprecatedTextCommandMessage(c);
+    const deprecatedMessage = getDeprecatedTextCommandMessage(msg.content.trim());
 
     if (deprecatedMessage) {
-      msg.reply(deprecatedMessage);
-      return;
-    }
-
-    const uid = msg.author.id;
-    const now = Date.now();
-
-const clearPending = clearConfirmations.get(uid);
-const moodPending = moodResetConfirmations.get(uid);
-const coinPending = coinClearConfirmations.get(uid);
-
-if (clearPending || moodPending || coinPending) {
-  if (c.toUpperCase() !== "Y") {
-    clearConfirmations.delete(uid);
-    moodResetConfirmations.delete(uid);
-    coinClearConfirmations.delete(uid);
-
-    msg.reply("已取消此次確認操作。");
-    return;
-  }
-
-  if (clearPending) {
-    await clearWork(clearPending.id);
-    clearConfirmations.delete(uid);
-
-    msg.reply(`已清除 ${clearPending.name} 的排行榜紀錄。`);
-    return;
-  }
-
-  if (moodPending) {
-    await resetMood(moodPending.id);
-    moodResetConfirmations.delete(uid);
-
-    msg.reply(`已重置 ${moodPending.name} 的心情指數為 0。`);
-    return;
-  }
-
-  if (coinPending) {
-    await clearCoins(coinPending.id);
-    coinClearConfirmations.delete(uid);
-
-    msg.reply(`已清除 ${coinPending.name} 的金幣。`);
-    return;
-  }
-}
-
-    if (c === "!面板" || c === "!幫助") {
-      await msg.reply(getPanel());
-      return;
-    }
-
-    if (c.startsWith("!查詢")) {
-      const targetUser = msg.mentions.users.first();
-
-      if (targetUser) {
-        const embed = await getSelfStatusEmbed(targetUser);
-        msg.reply({ embeds: [embed] });
-        return;
-      }
-
-      if (c === "!查詢") {
-        const embed = await getWorkingEmbed();
-        msg.reply({ embeds: [embed] });
-        return;
-      }
-    }
-
-    if (c === "!排行榜") {
-      const embed = await getRankingEmbed();
-      msg.reply({ embeds: [embed] });
-      return;
-    }
-
-    if (c === "!我的狀態") {
-      const embed = await getSelfStatusEmbed(msg.author);
-      msg.reply({ embeds: [embed] });
-      return;
-    }
-
-    if (c === "!wt voice") {
-      const embed = await getVoiceRankingEmbed();
-      msg.reply({ embeds: [embed] });
-      return;
-    }
-
-    if (c.startsWith("!wt voice clear")) {
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-
-      const u = msg.mentions.users.first();
-
-      if (!u) {
-        msg.reply("格式錯誤：`!wt voice clear @人`");
-        return;
-      }
-
-      voiceStartTimes.delete(u.id);
-      await removeActiveVoiceSession(u.id);
-
-      msg.reply(`已清除 ${u.username} 目前進行中的語音在線紀錄。`);
-      return;
-    }
-
-    if (c === "!wt panel timer") {
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-
-      msg.reply(getPanelRefreshRemainingText());
-      return;
-    }
-
-    if (c === "!wt refresh panel") {
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-
-      await resetPanelRefreshTimerAndRunNow();
-      msg.reply("已立即刷新面板頻道，並重新開始 1 小時計時器。");
-      return;
-    }
-
-    if (c.startsWith("!wt add worktime")) {
-
-        if (!isAdmin(msg.member)) {
-          msg.reply("你沒有權限使用這個指令。");
-          return;
-        }
-
-      const u = msg.mentions.users.first();
-      const sec = Number(c.split(/\s+/)[4]);
-
-      if (!u || !Number.isFinite(sec) || sec <= 0) {
-        msg.reply("格式錯誤：`!wt add worktime @人 秒數`");
-        return;
-      }
-
-      const currentStartTime = workStartTimes.get(u.id);
-
-      if (!currentStartTime) {
-        msg.reply("這位打工人目前沒有上班紀錄ㄛ！");
-        return;
-      }
-
-      const newStartTime = currentStartTime - sec * 1000;
-
-      workStartTimes.set(u.id, newStartTime);
-      await saveActiveSession(u.id, u.username, newStartTime);
-
-      msg.reply(`已為 ${u.username} 的本次上班時間增加 ${formatTime(sec)}。`);
-      return;
-    }
-
-    if (c.startsWith("!wt remove worktime")) {
-
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-
-      const u = msg.mentions.users.first();
-      if (!u) {
-        msg.reply("格式錯誤：`!wt remove worktime @人`");
-        return;
-      }
-
-      clearConfirmations.set(uid, {
-        id: u.id,
-        name: u.username,
-      });
-
-      msg.reply(`⚠️ 即將清除 ${u.username} 的排行榜紀錄，請輸入 \`Y\` 確認。`);
-      return;
-    }
-
-    if (c.startsWith("!wt add workmood")) {
-
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-
-      const u = msg.mentions.users.first();
-      const score = Number(c.split(/\s+/)[4]);
-
-      if (!u || !Number.isFinite(score)) {
-        msg.reply("格式錯誤：`!wt add workmood @人 指數`");
-        return;
-      }
-
-      await addMood(u.id, u.username, score);
-      msg.reply(`已為 ${u.username} 增加心情指數 ${score > 0 ? "+" : ""}${score}。`);
-      return;
-    }
-
-    if (c.startsWith("!wt remove workmood")) {
-
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-
-      const u = msg.mentions.users.first();
-
-      if (!u) {
-        msg.reply("格式錯誤：`!wt remove workmood @人`");
-        return;
-      }
-
-      moodResetConfirmations.set(uid, {
-        id: u.id,
-        name: u.username,
-      });
-
-      msg.reply(`⚠️ 即將重置 ${u.username} 的心情指數為 0，請輸入 \`Y\` 確認。`);
-      return;
-    }
-
-    if (c.startsWith("!wt add coin")) {
-
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-
-      const u = msg.mentions.users.first();
-      const amount = Number(c.split(/\s+/)[4]);
-
-      if (!u || !Number.isFinite(amount) || amount <= 0) {
-        msg.reply("格式錯誤：`!wt add coin @人 數量`");
-        return;
-      }
-
-      await addCoins(u.id, u.username, amount);
-      msg.reply(`已為 ${u.username} 增加 🪙 ${amount} 金幣。`);
-      return;
-    }
-
-    if (c.startsWith("!wt remove coin")) {
-
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-
-      const u = msg.mentions.users.first();
-
-      if (!u) {
-        msg.reply("格式錯誤：`!wt remove coin @人`");
-        return;
-      }
-
-      coinClearConfirmations.set(uid, {
-        id: u.id,
-        name: u.username,
-      });
-
-      msg.reply(`⚠️ 即將清除 ${u.username} 的金幣，請輸入 \`Y\` 確認。`);
-      return;
-    }
-
-    if (c.startsWith("!強制上班")) {
-
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-      
-      const u = msg.mentions.users.first();
-      if (!u) {
-        msg.reply("格式錯誤：`!強制上班 @人`");
-        return;
-      }
-
-      const startTime = now;
-
-      workStartTimes.set(u.id, startTime);
-      await saveActiveSession(u.id, u.username, startTime);
-
-      msg.reply(`${u.username} 已被強制設定為上班中。`);
-      return;
-    }
-
-    if (c.startsWith("!強制下班")) {
-
-      if (!isAdmin(msg.member)) {
-        msg.reply("你沒有權限使用這個指令。");
-        return;
-      }
-
-      const u = msg.mentions.users.first();
-      if (!u) {
-        msg.reply("格式錯誤：`!強制下班 @人`");
-        return;
-      }
-
-      const result = await endWork(u.id, u.username);
-      msg.reply(`${u.username} ${result.text}`);
-
-      if (result.ok) {
-        await sendMoodPrompt(u);
-      }
-
-      return;
-    }
-
-    if (isStart(c)) {
-      const text = await startWork(uid, msg.author.username);
-      msg.reply(`${msg.author} ${text}`);
-      return;
-    }
-
-    if (isEnd(c)) {
-      const result = await endWork(uid, msg.author.username);
-      msg.reply(`${msg.author} ${result.text}`);
-
-      if (result.ok) {
-        await sendMoodPrompt(msg.author);
-      }
+      await msg.reply(deprecatedMessage);
     }
   } catch (error) {
-    console.error("處理訊息時發生錯誤：", error);
+    console.error("處理舊文字指令提示時發生錯誤：", error);
   }
 });
-
 pool.on("error", (error) => {
   console.error("資料庫連線錯誤：", error);
 });
@@ -4566,7 +4643,9 @@ function stopAfterStartupFailure(error) {
   setTimeout(() => process.exit(1), deadlineMs);
   voiceKeepManualLeave = true;
   cancelVoiceKeepTimer();
+  cancelVoiceKeepStableTimer();
   if (voiceKeepHealthTimer) clearInterval(voiceKeepHealthTimer);
+  if (voiceSessionMaintenanceTimer) clearInterval(voiceSessionMaintenanceTimer);
   if (rankingRewardTimer) clearInterval(rankingRewardTimer);
   if (panelRefreshTimer) clearTimeout(panelRefreshTimer);
   // 不等待清理才啟動期限，且個別清理失敗不妨礙另一項。
@@ -4579,5 +4658,26 @@ function stopAfterStartupFailure(error) {
     }
   });
 }
+
+function handleUnexpectedProcessError(origin, error) {
+  console.error(`[Process ${origin}]`, error);
+
+  if (isTransientVoiceError(error) && voiceKeepTarget) {
+    requestVoiceKeepRecovery(`捕捉到 ${origin} 語音網路錯誤`, error);
+    return;
+  }
+
+  const normalizedError =
+    error instanceof Error ? error : new Error(String(error));
+  stopAfterStartupFailure(normalizedError);
+}
+
+process.on("unhandledRejection", (reason) => {
+  handleUnexpectedProcessError("unhandledRejection", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  handleUnexpectedProcessError("uncaughtException", error);
+});
 
 startBot().catch(stopAfterStartupFailure);

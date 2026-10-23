@@ -5,6 +5,7 @@ const {
   Client,
   GatewayIntentBits,
   Events,
+  Status,
   EmbedBuilder,
   ButtonBuilder,
   ButtonStyle,
@@ -35,7 +36,14 @@ const {
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  connectionTimeoutMillis: 10000,
+  application_name: "worktime-discord-bot",
+  max: 5,
+  min: 1,
+  connectionTimeoutMillis: 15000,
+  idleTimeoutMillis: 5 * 60 * 1000,
+  keepAlive: true,
+  keepAliveInitialDelayMillis: 10000,
+  maxLifetimeSeconds: 60 * 60,
 });
 
 const client = new Client({
@@ -77,6 +85,8 @@ let voiceKeepLastStateChangeAt = null;
 let voiceSessionMaintenanceTimer = null;
 let voiceSessionMaintenanceBusy = false;
 let voiceRuntimeLastDiagnosticAt = 0;
+let gatewayWatchdogTimer = null;
+let gatewayNotReadySince = null;
 
 const VOICE_SESSION_MAINTENANCE_INTERVAL_MS = 60 * 1000;
 const VOICE_SESSION_CHECKPOINT_INTERVAL_MS = 5 * 60 * 1000;
@@ -84,6 +94,7 @@ const VOICE_STALE_SESSION_GRACE_MS = 2 * 60 * 1000;
 const VOICE_RUNTIME_HEARTBEAT_KEY = "voice_runtime_heartbeat_at";
 const VOICE_KEEP_STABLE_RESET_MS = 5 * 60 * 1000;
 const VOICE_KEEP_STUCK_TIMEOUT_MS = 90 * 1000;
+const GATEWAY_STUCK_TIMEOUT_MS = 2 * 60 * 1000;
 
 const clearConfirmations = new Map();
 const moodResetConfirmations = new Map();
@@ -631,7 +642,7 @@ async function loadActiveSessions() {
 }
 
 async function saveActiveVoiceSession(userId, username, channelId, startTime) {
-  await pool.query(
+  await queryDatabaseWithRetry(
     `
     INSERT INTO active_voice_sessions (user_id, username, channel_id, start_time)
     VALUES ($1, $2, $3, $4)
@@ -641,25 +652,30 @@ async function saveActiveVoiceSession(userId, username, channelId, startTime) {
       channel_id = $3,
       start_time = $4
     `,
-    [userId, username, channelId, startTime]
+    [userId, username, channelId, startTime],
+    "儲存語音在線暫存"
   );
 }
 
 async function removeActiveVoiceSession(userId) {
-  await pool.query(
+  await queryDatabaseWithRetry(
     `
     DELETE FROM active_voice_sessions
     WHERE user_id = $1
     `,
-    [userId]
+    [userId],
+    "刪除語音在線暫存"
   );
 }
 
 async function loadActiveVoiceSessions() {
-  const result = await pool.query(`
+  const result = await queryDatabaseWithRetry(`
     SELECT user_id, username, channel_id, start_time
     FROM active_voice_sessions
-  `);
+  `,
+    undefined,
+    "載入語音在線暫存"
+  );
 
   voiceStartTimes.clear();
 
@@ -822,7 +838,14 @@ async function runVoiceSessionMaintenance() {
       );
     }
   } catch (error) {
-    console.error("語音在線維護失敗：", error);
+    if (isTransientDatabaseError(error)) {
+      console.warn(
+        "[Voice Runtime] PostgreSQL 暫時無法連線；" +
+          "語音狀態仍保留在記憶體，下一輪會自動補寫。"
+      );
+    } else {
+      console.error("語音在線維護失敗：", error);
+    }
   } finally {
     voiceSessionMaintenanceBusy = false;
   }
@@ -872,7 +895,8 @@ async function commitVoiceSegment(
     0,
     Math.floor((safeEndTime - Number(session.startTime || 0)) / 1000)
   );
-  const db = await pool.connect();
+  const db = await connectDatabaseWithRetry("取得語音結算資料庫連線");
+  let destroyDatabaseClient = false;
 
   try {
     await db.query("BEGIN");
@@ -957,21 +981,25 @@ async function commitVoiceSegment(
 
     return { voiceSeconds, earnedCoins, checkpointTime: safeEndTime };
   } catch (error) {
+    destroyDatabaseClient = isTransientDatabaseError(error);
     await db.query("ROLLBACK").catch(() => {});
     throw error;
   } finally {
-    db.release();
+    db.release(destroyDatabaseClient);
   }
 }
 
 async function getVoiceRankingEmbed() {
-  const result = await pool.query(`
+  const result = await queryDatabaseWithRetry(`
     SELECT user_id, username, total_seconds, coins
     FROM voice_totals
     WHERE total_seconds > 0
     ORDER BY total_seconds DESC
     LIMIT 25
-  `);
+  `,
+    undefined,
+    "讀取語音在線排行榜"
+  );
 
   const embed = new EmbedBuilder()
     .setTitle("🎧 語音在線時長排行榜")
@@ -1320,7 +1348,19 @@ async function leaveKeepVoiceChannel() {
 }
 
 async function getVoiceKeepStatusText() {
-  const channelId = await getBotSetting("voice_keep_channel_id");
+  let channelId = voiceKeepTarget;
+
+  if (!channelId) {
+    try {
+      channelId = await getBotSetting("voice_keep_channel_id");
+    } catch (error) {
+      return [
+        "目前無法從 PostgreSQL 讀取語音保活設定。",
+        `資料庫錯誤：${getDatabaseErrorText(error)}`,
+        "Discord 連線不會因此中止，系統會在下一輪自動重試。",
+      ].join("\n");
+    }
+  }
   const memory = process.memoryUsage();
   const runtimeLines = [
     `程序持續執行時間：${formatTime(Math.floor(process.uptime()))}`,
@@ -1328,6 +1368,20 @@ async function getVoiceKeepStatusText() {
       memory.heapUsed / 1024 / 1024
     )} MB`,
     `語音計時中人數：${voiceStartTimes.size}`,
+    `資料庫狀態：${
+      databaseConsecutiveFailures > 0
+        ? `暫時異常（連續失敗 ${databaseConsecutiveFailures} 次）`
+        : "正常"
+    }`,
+    `資料庫連線池：總計 ${pool.totalCount}／閒置 ${pool.idleCount}／等待 ${pool.waitingCount}`,
+    `資料庫最後成功：${
+      databaseLastSuccessAt
+        ? getTaipeiDateTimeText(new Date(databaseLastSuccessAt))
+        : "本次執行尚無紀錄"
+    }`,
+    ...(databaseLastErrorAt
+      ? [`資料庫最後錯誤：${getTaipeiDateTimeText(new Date(databaseLastErrorAt))}｜${databaseLastErrorText}`]
+      : []),
   ];
 
   if (!channelId) {
@@ -1900,38 +1954,41 @@ async function setBankRates(minRate, maxRate) {
 }
 
 async function setBotSetting(key, value) {
-  await pool.query(
+  await queryDatabaseWithRetry(
     `
     INSERT INTO bot_settings (setting_key, setting_value)
     VALUES ($1, $2)
     ON CONFLICT (setting_key)
     DO UPDATE SET setting_value = $2
     `,
-    [key, String(value)]
+    [key, String(value)],
+    "儲存 Bot 設定"
   );
 }
 
 async function getBotSetting(key) {
-  const result = await pool.query(
+  const result = await queryDatabaseWithRetry(
     `
     SELECT setting_value
     FROM bot_settings
     WHERE setting_key = $1
     LIMIT 1
     `,
-    [key]
+    [key],
+    "讀取 Bot 設定"
   );
 
   return result.rows[0]?.setting_value || null;
 }
 
 async function clearBotSetting(key) {
-  await pool.query(
+  await queryDatabaseWithRetry(
     `
     DELETE FROM bot_settings
     WHERE setting_key = $1
     `,
-    [key]
+    [key],
+    "刪除 Bot 設定"
   );
 }
 
@@ -3896,6 +3953,7 @@ async function endWork(userId, username) {
 client.once(Events.ClientReady, async () => {
   if (startupShutdownStarted) return;
   console.log(`BOT 已上線：${client.user.tag}`);
+  startGatewayWatchdog();
 
   try {
     await pool.query(`
@@ -4616,10 +4674,51 @@ client.on("messageCreate", async (msg) => {
   }
 });
 pool.on("error", (error) => {
-  console.error("資料庫連線錯誤：", error);
+  markDatabaseFailure(error);
+  console.warn(
+    "[Database Pool] 閒置連線失效，連線池已自動移除該連線：" +
+      getDatabaseErrorText(error)
+  );
+});
+
+pool.on("connect", () => {
+  markDatabaseSuccess();
 });
 
 let startupShutdownStarted = false;
+
+function startGatewayWatchdog() {
+  if (gatewayWatchdogTimer) clearInterval(gatewayWatchdogTimer);
+
+  gatewayNotReadySince = null;
+  gatewayWatchdogTimer = setInterval(() => {
+    if (startupShutdownStarted) return;
+
+    if (client.ws.status === Status.Ready) {
+      if (gatewayNotReadySince) {
+        console.log("[Gateway Watchdog] Gateway 已恢復 Ready 狀態。");
+      }
+      gatewayNotReadySince = null;
+      return;
+    }
+
+    if (!gatewayNotReadySince) {
+      gatewayNotReadySince = Date.now();
+      console.warn(
+        `[Gateway Watchdog] Gateway 進入 ${Status[client.ws.status] || client.ws.status} 狀態，等待自動恢復。`
+      );
+      return;
+    }
+
+    if (Date.now() - gatewayNotReadySince >= GATEWAY_STUCK_TIMEOUT_MS) {
+      clearInterval(gatewayWatchdogTimer);
+      gatewayWatchdogTimer = null;
+      stopAfterStartupFailure(
+        new Error("Discord Gateway 超過 2 分鐘未恢復，要求執行環境重新啟動 Bot。")
+      );
+    }
+  }, 30_000);
+}
 
 async function startBot() {
   if (!process.env.TOKEN) throw new Error("缺少 TOKEN 環境變數。");
@@ -4645,6 +4744,7 @@ function stopAfterStartupFailure(error) {
   cancelVoiceKeepTimer();
   cancelVoiceKeepStableTimer();
   if (voiceKeepHealthTimer) clearInterval(voiceKeepHealthTimer);
+  if (gatewayWatchdogTimer) clearInterval(gatewayWatchdogTimer);
   if (voiceSessionMaintenanceTimer) clearInterval(voiceSessionMaintenanceTimer);
   if (rankingRewardTimer) clearInterval(rankingRewardTimer);
   if (panelRefreshTimer) clearTimeout(panelRefreshTimer);
@@ -4661,6 +4761,14 @@ function stopAfterStartupFailure(error) {
 
 function handleUnexpectedProcessError(origin, error) {
   console.error(`[Process ${origin}]`, error);
+
+  if (isTransientDatabaseError(error)) {
+    markDatabaseFailure(error);
+    console.warn(
+      "[Process] PostgreSQL 暫時失聯；保留 Discord 與語音連線並等待下一輪重試。"
+    );
+    return;
+  }
 
   if (isTransientVoiceError(error) && voiceKeepTarget) {
     requestVoiceKeepRecovery(`捕捉到 ${origin} 語音網路錯誤`, error);
@@ -4679,5 +4787,88 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (error) => {
   handleUnexpectedProcessError("uncaughtException", error);
 });
+
+const DATABASE_RETRY_ATTEMPTS = 3;
+const DATABASE_RETRY_BASE_DELAY_MS = 1000;
+let databaseConsecutiveFailures = 0;
+let databaseLastSuccessAt = null;
+let databaseLastErrorAt = null;
+let databaseLastErrorText = null;
+
+function getDatabaseErrorText(error) {
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message}${error.code ? ` (${error.code})` : ""}`;
+  }
+
+  return String(error);
+}
+
+function isTransientDatabaseError(error) {
+  const code = String(error?.code || "");
+  const text = getDatabaseErrorText(error);
+
+  return (
+    /^08/.test(code) ||
+    /^(57P0[123]|53300|53400)$/.test(code) ||
+    /connection.*timeout|connection terminated|connection reset|socket.*closed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|server closed the connection|terminating connection|the database system is starting up|too many clients/i.test(
+      text
+    )
+  );
+}
+
+function waitForRetry(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function markDatabaseSuccess() {
+  const recovered = databaseConsecutiveFailures > 0;
+  databaseConsecutiveFailures = 0;
+  databaseLastSuccessAt = Date.now();
+
+  if (recovered) {
+    console.log("[Database] 連線已恢復。暫存的語音狀態會在本輪維護補寫。");
+  }
+}
+
+function markDatabaseFailure(error) {
+  databaseConsecutiveFailures += 1;
+  databaseLastErrorAt = Date.now();
+  databaseLastErrorText = getDatabaseErrorText(error);
+}
+
+async function withDatabaseRetry(operation, label, attempts = DATABASE_RETRY_ATTEMPTS) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const result = await operation();
+      markDatabaseSuccess();
+      return result;
+    } catch (error) {
+      lastError = error;
+      markDatabaseFailure(error);
+
+      if (!isTransientDatabaseError(error) || attempt >= attempts) break;
+
+      const baseDelay = DATABASE_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+      const delayMs = Math.round(baseDelay * (0.8 + Math.random() * 0.4));
+      console.warn(
+        `[Database] ${label} 暫時失敗，第 ${attempt}/${attempts} 次；` +
+          `${delayMs}ms 後重試：${getDatabaseErrorText(error)}`
+      );
+      await waitForRetry(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
+function queryDatabaseWithRetry(text, values, label) {
+  return withDatabaseRetry(() => pool.query(text, values), label);
+}
+
+function connectDatabaseWithRetry(label) {
+  return withDatabaseRetry(() => pool.connect(), label);
+}
 
 startBot().catch(stopAfterStartupFailure);

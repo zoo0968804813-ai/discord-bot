@@ -1,4 +1,4 @@
 git add .
-git commit -m "update off-work time format"
+git commit -m "To FIX offline problem"
 git push
 Pause

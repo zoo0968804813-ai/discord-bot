@@ -31,7 +31,7 @@ const {
   joinVoiceChannel,
   getVoiceConnection,
   VoiceConnectionStatus,
-  entersState,
+  VoiceConnectionDisconnectReason,
 } = require("@discordjs/voice");
 
 const pool = new Pool({
@@ -59,7 +59,12 @@ client.on("error", (error) => console.error("[Discord Client]", error));
 client.on("shardError", (error, shardId) => console.error("[Gateway] shard=" + shardId, error));
 client.on("warn", (warning) => console.warn("[Discord Warning]", warning));
 client.on("shardReconnecting", (shardId) => console.warn("[Gateway] reconnecting shard=" + shardId));
-client.on("shardDisconnect", (event, shardId) => console.warn("[Gateway] disconnected shard=" + shardId + " code=" + event.code));
+client.on("shardDisconnect", (event, shardId) => {
+  console.warn(
+    `[Gateway] disconnected shard=${shardId} code=${event.code} ` +
+      `reason=${event.reason || "none"} clean=${Boolean(event.wasClean)}`
+  );
+});
 client.on("shardResume", (shardId, replayedEvents) => {
   console.log(`[Gateway] resumed shard=${shardId} replayed=${replayedEvents}`);
   ensureVoiceKeepConnection("Discord Gateway 已恢復");
@@ -94,6 +99,8 @@ const VOICE_STALE_SESSION_GRACE_MS = 2 * 60 * 1000;
 const VOICE_RUNTIME_HEARTBEAT_KEY = "voice_runtime_heartbeat_at";
 const VOICE_KEEP_STABLE_RESET_MS = 5 * 60 * 1000;
 const VOICE_KEEP_STUCK_TIMEOUT_MS = 90 * 1000;
+const VOICE_KEEP_JOIN_TIMEOUT_MS = 45 * 1000;
+const VOICE_KEEP_DISCONNECT_GRACE_MS = 45 * 1000;
 const GATEWAY_STUCK_TIMEOUT_MS = 2 * 60 * 1000;
 
 const clearConfirmations = new Map();
@@ -1097,6 +1104,7 @@ let voiceKeepTarget = null;
 let voiceKeepConnection = null;
 let voiceKeepOperation = Promise.resolve();
 let voiceKeepStopping = false;
+let voiceKeepPendingRecovery = null;
 const voiceKeepIgnored = new WeakSet();
 const voiceKeepBoundConnections = new WeakSet();
 
@@ -1108,10 +1116,86 @@ function getErrorText(error) {
   return String(error);
 }
 
+function formatVoiceDisconnectReason(reason) {
+  if (reason === undefined || reason === null) return "none";
+  return VoiceConnectionDisconnectReason[reason] || String(reason);
+}
+
+function getVoiceConnectionDiagnostic(connection, state = connection?.state) {
+  const ping = connection?.ping || {};
+  const details = [
+    `status=${state?.status || "none"}`,
+    `reason=${formatVoiceDisconnectReason(state?.reason)}`,
+    `closeCode=${state?.closeCode ?? "none"}`,
+    `rejoinAttempts=${connection?.rejoinAttempts ?? 0}`,
+    `wsPing=${ping.ws ?? "n/a"}`,
+    `udpPing=${ping.udp ?? "n/a"}`,
+  ];
+  return details.join(" ");
+}
+
+function createVoiceReadyError(code, message, cause = null) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.code = code;
+  return error;
+}
+
+function waitForVoiceReady(connection, timeoutMs) {
+  if (connection.state.status === VoiceConnectionStatus.Ready) {
+    return Promise.resolve(connection);
+  }
+  if (connection.state.status === VoiceConnectionStatus.Destroyed) {
+    return Promise.reject(
+      createVoiceReadyError(
+        "VOICE_CONNECTION_DESTROYED",
+        "語音連線已被銷毀，無法繼續等待 Ready。"
+      )
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      connection.off(VoiceConnectionStatus.Ready, onReady);
+      connection.off(VoiceConnectionStatus.Destroyed, onDestroyed);
+    };
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(connection);
+    };
+    const onReady = () => finish();
+    const onDestroyed = () =>
+      finish(
+        createVoiceReadyError(
+          "VOICE_CONNECTION_DESTROYED",
+          "語音連線在等待 Ready 時被銷毀。"
+        )
+      );
+    const timer = setTimeout(() => {
+      finish(
+        createVoiceReadyError(
+          "VOICE_READY_TIMEOUT",
+          `語音連線在 ${Math.round(timeoutMs / 1000)} 秒內未進入 Ready 狀態。`
+        )
+      );
+    }, timeoutMs);
+
+    connection.once(VoiceConnectionStatus.Ready, onReady);
+    connection.once(VoiceConnectionStatus.Destroyed, onDestroyed);
+
+    if (connection.state.status === VoiceConnectionStatus.Ready) onReady();
+    else if (connection.state.status === VoiceConnectionStatus.Destroyed) onDestroyed();
+  });
+}
+
 function isTransientVoiceError(error) {
   const text = getErrorText(error);
 
-  return /Unexpected server response:\s*5\d\d|WebSocket.*closed|socket.*closed|IP discovery|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|UND_ERR|voice connection|voice websocket|udp/i.test(
+  return /VOICE_READY_TIMEOUT|VOICE_CONNECTION_DESTROYED|Unexpected server response:\s*5\d\d|WebSocket.*closed|socket.*closed|IP discovery|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|UND_ERR|voice connection|voice websocket|udp/i.test(
     text
   );
 }
@@ -1142,6 +1226,16 @@ function requestVoiceKeepRecovery(reason, error = null) {
   }
 
   const detail = error ? `\n${getErrorText(error)}` : "";
+
+  if (voiceKeepBusy) {
+    voiceKeepPendingRecovery = { reason, error };
+    console.warn(
+      `[Voice Keep] recovery deferred while join is active: ${reason}${detail}`
+    );
+    return;
+  }
+
+  voiceKeepPendingRecovery = null;
   console.warn(`[Voice Keep] recovery requested: ${reason}${detail}`);
   cancelVoiceKeepStableTimer();
 
@@ -1163,11 +1257,25 @@ function ensureVoiceKeepConnection(reason) {
   if (voiceKeepManualLeave || voiceKeepStopping || !voiceKeepTarget) return;
 
   const connection = voiceKeepConnection;
+  const status = connection?.state.status;
 
   if (
-    connection?.state.status === VoiceConnectionStatus.Ready &&
+    status === VoiceConnectionStatus.Ready &&
     connection.joinConfig.channelId === voiceKeepTarget
   ) {
+    return;
+  }
+
+  if (
+    voiceKeepBusy ||
+    status === VoiceConnectionStatus.Connecting ||
+    status === VoiceConnectionStatus.Signalling ||
+    status === VoiceConnectionStatus.Disconnected
+  ) {
+    console.warn(
+      `[Voice Keep] ${reason}；保留現有連線等待自動恢復。 ` +
+        getVoiceConnectionDiagnostic(connection)
+    );
     return;
   }
 
@@ -1182,6 +1290,18 @@ function joinKeepVoiceChannel(channelId, options = {}) {
   const generation = voiceKeepGeneration;
   voiceKeepOperation = performKeepJoin(channelId, options, generation).finally(() => {
     voiceKeepBusy = false;
+    const pendingRecovery = voiceKeepPendingRecovery;
+    voiceKeepPendingRecovery = null;
+
+    if (
+      pendingRecovery &&
+      voiceKeepConnection?.state.status === VoiceConnectionStatus.Ready
+    ) {
+      console.log(
+        `[Voice Keep] 加入期間的短暫異常已自行恢復：${pendingRecovery.reason}`
+      );
+    }
+
     if (!voiceKeepManualLeave && voiceKeepTarget &&
         voiceKeepConnection?.state.status !== VoiceConnectionStatus.Ready) {
       scheduleVoiceKeepReconnect(voiceKeepTarget);
@@ -1228,9 +1348,10 @@ async function performKeepJoin(channelId, options, generation) {
     adapterCreator: channel.guild.voiceAdapterCreator, selfDeaf: true, selfMute: false,
   });
   voiceKeepConnection = connection;
+  voiceKeepLastStateChangeAt = Date.now();
   bindVoiceKeepConnectionEvents(connection, channel.id);
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+    await waitForVoiceReady(connection, VOICE_KEEP_JOIN_TIMEOUT_MS);
     checkCancelled();
     return channel;
   } catch (error) {
@@ -1249,9 +1370,13 @@ function bindVoiceKeepConnectionEvents(connection, channelId) {
     voiceKeepConnection === connection && voiceKeepTarget === channelId;
   let recovering = false;
 
-  connection.on("stateChange", (_oldState, newState) => {
+  connection.on("stateChange", (oldState, newState) => {
     if (!active()) return;
     voiceKeepLastStateChangeAt = Date.now();
+    console.log(
+      `[Voice State] channel=${channelId} ${oldState.status}->${newState.status} ` +
+        getVoiceConnectionDiagnostic(connection, newState)
+    );
 
     if (newState.status !== VoiceConnectionStatus.Ready) {
       cancelVoiceKeepStableTimer();
@@ -1259,9 +1384,13 @@ function bindVoiceKeepConnectionEvents(connection, channelId) {
   });
 
   connection.on("error", (error) => {
-    console.error(`[Voice WebSocket] channel=${channelId}`, error);
+    console.error(
+      `[Voice WebSocket] channel=${channelId} ` +
+        `${getVoiceConnectionDiagnostic(connection)}`,
+      error
+    );
     if (!active()) return;
-    requestVoiceKeepRecovery("語音連線錯誤", error);
+    ensureVoiceKeepConnection("語音連線回報錯誤");
   });
 
   connection.on(VoiceConnectionStatus.Ready, () => {
@@ -1278,15 +1407,31 @@ function bindVoiceKeepConnectionEvents(connection, channelId) {
     void sendVoiceKeepLog("✅ 語音保活連線就緒", `頻道：<#${channelId}>\n累計重連：${voiceKeepReconnectTotal}`, 0x2ecc71);
   });
 
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+  connection.on(VoiceConnectionStatus.Disconnected, async (_oldState, newState) => {
     if (!active() || recovering) return;
+    const diagnostic = getVoiceConnectionDiagnostic(connection, newState);
+
+    if (newState?.reason === VoiceConnectionDisconnectReason.WebSocketClose) {
+      requestVoiceKeepRecovery(
+        `Discord 語音 WebSocket 要求重建連線｜${diagnostic}`
+      );
+      return;
+    }
+
     recovering = true;
-    void sendVoiceKeepLog("🟠 語音連線中斷", `頻道：<#${channelId}>\n等待自動恢復。`, 0xe67e22);
+    void sendVoiceKeepLog(
+      "🟠 語音連線中斷",
+      `頻道：<#${channelId}>\n等待 ${VOICE_KEEP_DISCONNECT_GRACE_MS / 1000} 秒自動恢復。\n${diagnostic}`,
+      0xe67e22
+    );
     try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+      await waitForVoiceReady(connection, VOICE_KEEP_DISCONNECT_GRACE_MS);
     } catch (error) {
       if (active()) {
-        requestVoiceKeepRecovery("語音中斷後 20 秒內未自動恢復", error);
+        requestVoiceKeepRecovery(
+          `語音中斷後 ${VOICE_KEEP_DISCONNECT_GRACE_MS / 1000} 秒內未自動恢復｜${diagnostic}`,
+          error
+        );
       }
     } finally { recovering = false; }
   });
@@ -1328,6 +1473,7 @@ async function leaveKeepVoiceChannel() {
   if (voiceKeepStopping) return { ok: false, text: "正在停止語音保活，請稍候。" };
   voiceKeepStopping = true;
   voiceKeepManualLeave = true;
+  voiceKeepPendingRecovery = null;
   voiceKeepGeneration += 1;
   cancelVoiceKeepTimer();
   cancelVoiceKeepStableTimer();
@@ -1431,7 +1577,18 @@ function startVoiceKeepHealthCheck() {
 
     const connection = voiceKeepConnection;
 
-    if (connection?.state.status === VoiceConnectionStatus.Ready) {
+    if (!connection) {
+      scheduleVoiceKeepReconnect(voiceKeepTarget);
+      return;
+    }
+
+    if (connection.state.status === VoiceConnectionStatus.Destroyed) {
+      voiceKeepConnection = null;
+      scheduleVoiceKeepReconnect(voiceKeepTarget);
+      return;
+    }
+
+    if (connection.state.status === VoiceConnectionStatus.Ready) {
       const guild = client.guilds.cache.get(connection.joinConfig.guildId);
       const actualChannelId = guild?.members.me?.voice?.channelId || null;
 
@@ -1445,12 +1602,13 @@ function startVoiceKeepHealthCheck() {
       return;
     }
 
-    const stateAge = Date.now() - Number(voiceKeepLastStateChangeAt || 0);
+    const stateAge = Date.now() - Number(voiceKeepLastStateChangeAt || Date.now());
 
     if (stateAge >= VOICE_KEEP_STUCK_TIMEOUT_MS) {
-      requestVoiceKeepRecovery("語音連線長時間未進入 Ready 狀態");
-    } else {
-      scheduleVoiceKeepReconnect(voiceKeepTarget);
+      requestVoiceKeepRecovery(
+        `語音連線超過 ${VOICE_KEEP_STUCK_TIMEOUT_MS / 1000} 秒未進入 Ready｜` +
+          getVoiceConnectionDiagnostic(connection)
+      );
     }
   }, 30_000);
 }
